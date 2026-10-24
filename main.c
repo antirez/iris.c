@@ -471,6 +471,7 @@ int main(int argc, char *argv[]) {
         actual_seed = params.seed;
     } else {
         actual_seed = (int64_t)time(NULL);
+        params.seed = actual_seed;
     }
     iris_set_seed(actual_seed);
     LOG_NORMAL("Seed: %lld\n", (long long)actual_seed);
