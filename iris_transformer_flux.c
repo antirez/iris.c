@@ -2362,6 +2362,12 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     if (!iris_metal_available() || !iris_metal_shaders_available()) return 0;
     if (block->qkv_mlp_weight_bf16 == NULL) return 0;  /* Need bf16 weights */
 
+    /* In mmap mode, the OS may reuse the same virtual address for different blocks'
+     * weights after munmap. The f16 weight cache is keyed by CPU pointer, so it
+     * would return a stale Metal buffer for the new block. Clear it to avoid wrong
+     * outputs in multi-step denoising when --mmap is used. */
+    if (tf->use_mmap) iris_metal_clear_f16_cache_only();
+
     int h_size = tf->hidden_size;
     int heads = tf->num_heads;
     int head_dim = tf->head_dim;
