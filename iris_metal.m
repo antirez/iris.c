@@ -2878,6 +2878,13 @@ int iris_gpu_attention_mps_bf16(iris_gpu_tensor_t out,
         id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
         if (!bufScores) return 0;
 
+        /* Zero the scores buffer before use. Pool buffers may be reused from a
+         * previous operation that wrote differently-typed data; those bytes
+         * interpreted as f16 can produce NaN bit patterns. MPSMatrixMultiplication
+         * with beta=0.0f still evaluates 0*NaN=NaN in IEEE 754, so the output
+         * would inherit NaN from the stale buffer. Zeroing ensures a clean start. */
+        memset([bufScores contents], 0, scores_size);
+
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
 
         /* === Phase 1: Q @ K^T for each head === */

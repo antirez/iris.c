@@ -2396,7 +2396,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
 
     /* Allocate output tensors */
     iris_gpu_tensor_t norm_gpu = iris_gpu_tensor_alloc(seq * h_size);
-    iris_gpu_tensor_t fused_gpu = iris_gpu_tensor_alloc(seq * fused_dim);
     iris_gpu_tensor_t q_gpu = iris_gpu_tensor_alloc(seq * h_size);
     iris_gpu_tensor_t k_gpu = iris_gpu_tensor_alloc(seq * h_size);
     iris_gpu_tensor_t v_gpu = iris_gpu_tensor_alloc(seq * h_size);
@@ -2406,12 +2405,11 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
     iris_gpu_tensor_t concat_gpu = iris_gpu_tensor_alloc(seq * (h_size + mlp_hidden));
     iris_gpu_tensor_t proj_out_gpu = iris_gpu_tensor_alloc(seq * h_size);
 
-    if (!norm_gpu || !fused_gpu || !q_gpu || !k_gpu || !v_gpu ||
+    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
         !gate_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
         /* Cleanup and fall back */
         if (hidden_gpu) iris_gpu_tensor_free(hidden_gpu);
         if (norm_gpu) iris_gpu_tensor_free(norm_gpu);
-        if (fused_gpu) iris_gpu_tensor_free(fused_gpu);
         if (q_gpu) iris_gpu_tensor_free(q_gpu);
         if (k_gpu) iris_gpu_tensor_free(k_gpu);
         if (v_gpu) iris_gpu_tensor_free(v_gpu);
@@ -2435,7 +2433,6 @@ static int single_block_forward_gpu(float *hidden, const single_block_t *block,
         /* Cleanup and fall back */
         iris_gpu_tensor_free(hidden_gpu);
         iris_gpu_tensor_free(norm_gpu);
-        iris_gpu_tensor_free(fused_gpu);
         iris_gpu_tensor_free(q_gpu);
         iris_gpu_tensor_free(k_gpu);
         iris_gpu_tensor_free(v_gpu);
