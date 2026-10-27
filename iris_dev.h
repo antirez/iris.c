@@ -27,6 +27,8 @@ extern "C" {
 /* Initialize the device. Returns 1 if a usable GPU was found. */
 int iris_dev_init(void);
 int iris_dev_available(void);
+/* Non-causal MHA avoids a full quadratic attention-score allocation. */
+int iris_dev_has_memory_efficient_attention(void);
 const char *iris_dev_name(void);
 void iris_dev_cleanup(void);   /* Release the stream and BLAS handle */
 

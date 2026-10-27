@@ -108,6 +108,14 @@ typedef struct {
  */
 iris_ctx *iris_load_dir(const char *model_dir);
 
+/* Opt in to images beyond 1792 pixels per side (up to 4096 per side,
+ * subject to tensor size limits). VAE buffers are allocated on demand.
+ * Passing zero preserves iris_load_dir() behavior. */
+iris_ctx *iris_load_dir_ex(const char *model_dir, int allow_large_images);
+
+/* Current per-side image limit, also used by the interactive CLI. */
+int iris_max_image_dimension(const iris_ctx *ctx);
+
 /*
  * Free model and all associated resources.
  */

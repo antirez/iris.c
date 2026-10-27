@@ -474,6 +474,13 @@ int iris_metal_available(void) {
     return g_initialized;
 }
 
+int iris_metal_has_memory_efficient_attention(void) {
+    return g_initialized && g_shaders_initialized &&
+           !getenv("IRIS_USE_MANUAL_SDPA") &&
+           [MPSGraph instancesRespondToSelector:
+               @selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)];
+}
+
 static void clear_bf16_cache(void);
 static void clear_f16_cache(void);
 static void clear_rope_cache(void);
@@ -4733,9 +4740,11 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
      * Can be disabled for debugging/regression comparisons by setting:
      *   IRIS_USE_MANUAL_SDPA=1
      */
-    static int s_force_manual_sdpa = -1;
-    if (s_force_manual_sdpa < 0) {
-        s_force_manual_sdpa = getenv("IRIS_USE_MANUAL_SDPA") ? 1 : 0;
+    int native_sdpa = iris_metal_has_memory_efficient_attention();
+    if (!native_sdpa &&
+        (size_t)num_heads * seq_q * seq_k * sizeof(float) >= ((size_t)4 << 30)) {
+        fprintf(stderr, "Manual Metal attention score matrix exceeds the 4 GiB limit\n");
+        return NULL;
     }
 
     pthread_mutex_lock(&g_sdpa_graph_mutex);
@@ -4785,8 +4794,7 @@ static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_he
 
         MPSGraphTensor *outTensor = nil;
 
-        if (!s_force_manual_sdpa &&
-            [graph respondsToSelector:@selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)]) {
+        if (native_sdpa) {
             /* Native SDPA is significantly more memory-efficient than materializing
              * the full [heads, seq_q, seq_k] score matrix for long sequences. */
             MPSGraphTensor *out = [graph scaledDotProductAttentionWithQueryTensor:qT

@@ -14,6 +14,7 @@
 #include "iris.h"
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
+#include <limits.h>
 #ifdef USE_METAL
 #include "iris_metal.h"
 #endif
@@ -130,6 +131,41 @@ typedef struct iris_vae {
 
 /* Forward declarations */
 void iris_vae_free(iris_vae_t *vae);
+
+void (*iris_vae_memory_callback)(int width, int height, size_t bytes) = NULL;
+
+/* Scratch contents do not survive an encode/decode call. Grow capacity between
+ * calls, releasing old buffers first to avoid reserving both sizes at once. */
+int iris_vae_reserve(iris_vae_t *vae, int batch, int H, int W) {
+    if (!vae || batch <= 0 || H <= 0 || W <= 0 || H > 4096 || W > 4096)
+        return 0;
+    /* CPU kernels use int element counts. A decoder upsample can have twice
+     * base_channels at full resolution, including on GPU fallback. */
+    size_t max_pixels = (size_t)INT_MAX / (2 * vae->base_channels);
+    if ((size_t)batch > max_pixels / H / W) return 0;
+    size_t pixels = (size_t)batch * H * W;
+    size_t bytes = 4 * (size_t)vae->base_channels * pixels * sizeof(float);
+    if (bytes <= vae->work_size) return 1;
+
+    if (iris_vae_memory_callback) iris_vae_memory_callback(W, H, 3 * bytes);
+    free(vae->work1);
+    free(vae->work2);
+    free(vae->work3);
+    vae->work1 = vae->work2 = vae->work3 = NULL;
+    vae->work_size = 0;
+    float *a = malloc(bytes), *b = malloc(bytes), *c = malloc(bytes);
+    if (!a || !b || !c) {
+        free(a);
+        free(b);
+        free(c);
+        return 0;
+    }
+    vae->work1 = a;
+    vae->work2 = b;
+    vae->work3 = c;
+    vae->work_size = bytes;
+    return 1;
+}
 #ifdef VAE_DEV
 static float *vae_encode_dev(iris_vae_t *vae, const float *img, int H, int W,
                              int *out_h, int *out_w);
@@ -391,6 +427,7 @@ static float *vae_finish_latent(iris_vae_t *vae, const float *moments, int batch
 float *iris_vae_encode(iris_vae_t *vae, const float *img,
                        int batch, int H, int W,
                        int *out_h, int *out_w) {
+    if (!iris_vae_reserve(vae, batch, H, W)) return NULL;
     /*
      * Encoder path:
      * [B, 3, H, W] -> conv_in -> down_blocks -> mid_block -> norm -> conv_out
@@ -1327,6 +1364,8 @@ static float *vae_encode_dev(iris_vae_t *vae, const float *img, int H, int W,
 
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
+    if (latent_h <= 0 || latent_w <= 0 || latent_h > 256 || latent_w > 256 ||
+        !iris_vae_reserve(vae, batch, latent_h * 16, latent_w * 16)) return NULL;
 #ifdef USE_METAL
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
@@ -1873,7 +1912,8 @@ static int load_attnblock_sf(safetensors_file_t *sf, vae_attnblock_t *block,
 iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                           int z_channels,
                                           float scaling_factor,
-                                          float shift_factor) {
+                                          float shift_factor,
+                                          int allow_large_images) {
     iris_vae_t *vae = calloc(1, sizeof(iris_vae_t));
     if (!vae) return NULL;
 
@@ -2024,6 +2064,7 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
      * For 1024x1024: ~2GB per buffer, ~6GB total working memory
      * For 1792x1792: ~6GB per buffer, ~18GB total working memory
      */
+    if (allow_large_images) return vae;
     size_t max_spatial = (size_t)vae->max_h * vae->max_w;
     size_t max_channels = vae->base_channels;  /* 128 at full resolution */
     vae->work_size = 4 * max_channels * max_spatial * sizeof(float);
@@ -2041,5 +2082,5 @@ iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
 
 /* Backward-compatible wrapper: loads with Flux defaults (z_channels=32, no scaling) */
 iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf) {
-    return iris_vae_load_safetensors_ex(sf, 32, 0.0f, 0.0f);
+    return iris_vae_load_safetensors_ex(sf, 32, 0.0f, 0.0f, 0);
 }

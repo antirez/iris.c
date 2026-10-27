@@ -15,9 +15,13 @@
 #include <math.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <limits.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#endif
+#ifdef IRIS_DEV
+#include "iris_dev.h"
 #endif
 
 /* ========================================================================
@@ -39,7 +43,9 @@ extern iris_vae_t *iris_vae_load_safetensors(safetensors_file_t *sf);
 extern iris_vae_t *iris_vae_load_safetensors_ex(safetensors_file_t *sf,
                                                   int z_channels,
                                                   float scaling_factor,
-                                                  float shift_factor);
+                                                  float shift_factor,
+                                                  int allow_large_images);
+extern int iris_vae_reserve(iris_vae_t *vae, int batch, int H, int W);
 extern void iris_vae_free(iris_vae_t *vae);
 extern float *iris_vae_encode(iris_vae_t *vae, const float *img,
                               int batch, int H, int W, int *out_h, int *out_w);
@@ -203,6 +209,7 @@ struct iris_ctx {
     /* Configuration */
     int max_width;
     int max_height;
+    int allow_large_images;
     int default_steps;
     float default_guidance;
     int is_distilled;  /* 1 = distilled (4-step), 0 = base (50-step CFG) */
@@ -254,6 +261,35 @@ static void set_error(const char *msg) {
     g_error_msg[sizeof(g_error_msg) - 1] = '\0';
 }
 
+int iris_max_image_dimension(const iris_ctx *ctx) {
+    return ctx ? ctx->max_width : IRIS_VAE_MAX_DIM;
+}
+
+static void image_size_error(const iris_ctx *ctx) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "Image dimensions exceed maximum (%dx%d)%s",
+             ctx->max_width, ctx->max_height,
+             ctx->allow_large_images ? "" : "; use --allow-large-images to opt in");
+    set_error(msg);
+}
+
+/* Reserve output scratch before denoising. References can grow it further
+ * during encoding; buffers are shared and reused, not added per reference. */
+static int prepare_vae(iris_ctx *ctx, int width, int height) {
+    if (!ctx->allow_large_images) return 1;
+    if (width <= 0 || height <= 0 || width > ctx->max_width ||
+        height > ctx->max_height ||
+        (size_t)width * height > (size_t)INT_MAX / 256) {
+        set_error("Image dimensions exceed supported VAE tensor size");
+        return 0;
+    }
+    if (!iris_vae_reserve(ctx->vae, 1, height, width)) {
+        set_error("Out of memory");
+        return 0;
+    }
+    return 1;
+}
+
 /* ========================================================================
  * Model Loading from HuggingFace-style directory with safetensors files
  * ======================================================================== */
@@ -270,6 +306,10 @@ static int file_exists(const char *path) {
  * eagerly; the text encoder and transformer are deferred to generation
  * time so they can be swapped in/out on memory-constrained systems. */
 iris_ctx *iris_load_dir(const char *model_dir) {
+    return iris_load_dir_ex(model_dir, 0);
+}
+
+iris_ctx *iris_load_dir_ex(const char *model_dir, int allow_large_images) {
     char path[1024];
 
     iris_ctx *ctx = calloc(1, sizeof(iris_ctx));
@@ -279,8 +319,9 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     }
 
     /* Set defaults - max 1792x1792 (requires ~18GB VAE work buffers) */
-    ctx->max_width = IRIS_VAE_MAX_DIM;
-    ctx->max_height = IRIS_VAE_MAX_DIM;
+    ctx->allow_large_images = allow_large_images != 0;
+    ctx->max_width = allow_large_images ? 4096 : IRIS_VAE_MAX_DIM;
+    ctx->max_height = ctx->max_width;
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
@@ -504,7 +545,8 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->vae = iris_vae_load_safetensors_ex(sf,
-                ctx->vae_z_channels, ctx->vae_scaling, ctx->vae_shift);
+                ctx->vae_z_channels, ctx->vae_scaling, ctx->vae_shift,
+                ctx->allow_large_images);
             safetensors_close(sf);
         }
     }
@@ -757,10 +799,11 @@ static iris_image *iris_generate_zimage_with_embeddings(iris_ctx *ctx,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         return NULL;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     /* Release text encoder to free memory before loading transformer */
     iris_release_text_encoder(ctx);
@@ -864,10 +907,11 @@ static iris_image *iris_generate_flux3_with_embeddings(iris_ctx *ctx,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         return NULL;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     iris_release_text_encoder(ctx);
     if (!iris_load_flux3_transformer_if_needed(ctx)) return NULL;
@@ -907,10 +951,10 @@ static iris_image *iris_generate_flux3_with_embeddings(iris_ctx *ctx,
 #define FLUX3_REF_AREA_SINGLE (4 * 1024 * 1024)
 #define FLUX3_REF_AREA_MULTI (1024 * 1024)
 
-static int flux3_canvas_side(int side) {
+static int flux3_canvas_side(int side, int max_dim) {
     int c = (side + 15) / 16 * 16;
     if (c < 64) c = 64;
-    return c > IRIS_VAE_MAX_DIM ? IRIS_VAE_MAX_DIM : c;
+    return c > max_dim ? max_dim : c;
 }
 
 /* Index into [0, n) for a padded coordinate: numpy "reflect" (edge pixel
@@ -924,7 +968,7 @@ static int flux3_pad_index(int i, int n, int symmetric) {
     return i;
 }
 
-static iris_image *flux3_prepare_reference(const iris_image *img, int single, int crop[4]) {
+static iris_image *flux3_prepare_reference(const iris_image *img, int single, int crop[4], int max_dim) {
     int w = img->width, h = img->height, ch = img->channels;
     int nw = w, nh = h;
     double scale;
@@ -932,21 +976,21 @@ static iris_image *flux3_prepare_reference(const iris_image *img, int single, in
     if (single) {
         scale = sqrt((double)FLUX3_REF_AREA_SINGLE / ((double)w * h));
         if (scale > 1.0) scale = 1.0;
-        if (scale > (double)IRIS_VAE_MAX_DIM / (w > h ? w : h))
-            scale = (double)IRIS_VAE_MAX_DIM / (w > h ? w : h);
+        if (scale > (double)max_dim / (w > h ? w : h))
+            scale = (double)max_dim / (w > h ? w : h);
         for (;;) {
             nw = (int)lround(w * scale);
             nh = (int)lround(h * scale);
             if (nw < 1) nw = 1;
             if (nh < 1) nh = 1;
-            if ((long)flux3_canvas_side(nw) * flux3_canvas_side(nh) <= FLUX3_REF_AREA_SINGLE) break;
+            if ((long)flux3_canvas_side(nw, max_dim) * flux3_canvas_side(nh, max_dim) <= FLUX3_REF_AREA_SINGLE) break;
             scale *= 0.995;
         }
     } else {
         scale = 1.0;
         if ((long)w * h > FLUX3_REF_AREA_MULTI) scale = sqrt((double)FLUX3_REF_AREA_MULTI / ((double)w * h));
-        if (scale > (double)IRIS_VAE_MAX_DIM / (w > h ? w : h))
-            scale = (double)IRIS_VAE_MAX_DIM / (w > h ? w : h);
+        if (scale > (double)max_dim / (w > h ? w : h))
+            scale = (double)max_dim / (w > h ? w : h);
         if (scale < 1.0) {
             nw = (int)(w * scale);
             nh = (int)(h * scale);
@@ -961,8 +1005,8 @@ static iris_image *flux3_prepare_reference(const iris_image *img, int single, in
     /* Target size and the source box inside it. */
     int tw, th, left, top;
     if (single) {
-        tw = flux3_canvas_side(nw);
-        th = flux3_canvas_side(nh);
+        tw = flux3_canvas_side(nw, max_dim);
+        th = flux3_canvas_side(nh, max_dim);
         left = (tw - nw) / 2;
         top = (th - nh) / 2;
         crop[0] = left;
@@ -1004,13 +1048,48 @@ static iris_image *iris_generate_flux3_refs(iris_ctx *ctx, const char *prompt,
     int crop[4] = {0, 0, 0, 0};
     float **lat = calloc(num_refs, sizeof(float *));
     int *lh = calloc(num_refs, sizeof(int)), *lw = calloc(num_refs, sizeof(int));
+    iris_image **prepared = NULL;
     iris_image *img = NULL;
     float *text_emb = NULL, *uncond_emb = NULL;
     if (!lat || !lh || !lw) goto done;
 
+    if (ctx->allow_large_images) {
+        /* Plan one capacity for output and prepared references before encoding.
+         * Only the largest area matters because the VAE processes them in turn. */
+        int max_w = 0, max_h = 0;
+        if (size_given) {
+            p.width = p.width / 16 * 16;
+            p.height = p.height / 16 * 16;
+            if (p.width < 64) p.width = 64;
+            if (p.height < 64) p.height = 64;
+            if (p.width > ctx->max_width || p.height > ctx->max_height) {
+                image_size_error(ctx);
+                goto done;
+            }
+            max_w = p.width;
+            max_h = p.height;
+        }
+        prepared = calloc(num_refs, sizeof(*prepared));
+        if (!prepared) goto done;
+        for (int i = 0; i < num_refs; i++) {
+            prepared[i] = flux3_prepare_reference(refs[i], num_refs == 1, crop,
+                                                  ctx->max_width);
+            if (!prepared[i]) {
+                set_error("Failed to prepare reference image");
+                goto done;
+            }
+            if ((size_t)prepared[i]->width * prepared[i]->height > (size_t)max_w * max_h) {
+                max_w = prepared[i]->width;
+                max_h = prepared[i]->height;
+            }
+        }
+        if (!prepare_vae(ctx, max_w, max_h)) goto done;
+    }
+
     if (iris_phase_callback) iris_phase_callback("encoding reference images", 0);
     for (int i = 0; i < num_refs; i++) {
-        iris_image *prep = flux3_prepare_reference(refs[i], num_refs == 1, crop);
+        iris_image *prep = prepared ? prepared[i] :
+            flux3_prepare_reference(refs[i], num_refs == 1, crop, ctx->max_width);
         if (!prep) {
             set_error("Failed to prepare reference image");
             goto done;
@@ -1019,6 +1098,7 @@ static iris_image *iris_generate_flux3_refs(iris_ctx *ctx, const char *prompt,
         lat[i] = iris_vae_encode(ctx->vae, tensor, 1, prep->height, prep->width, &lh[i], &lw[i]);
         free(tensor);
         iris_image_free(prep);
+        if (prepared) prepared[i] = NULL;
         if (!lat[i]) {
             set_error("Failed to encode reference image");
             goto done;
@@ -1034,10 +1114,11 @@ static iris_image *iris_generate_flux3_refs(iris_ctx *ctx, const char *prompt,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         goto done;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) goto done;
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
@@ -1092,6 +1173,10 @@ static iris_image *iris_generate_flux3_refs(iris_ctx *ctx, const char *prompt,
     }
 
 done:
+    if (prepared) {
+        for (int i = 0; i < num_refs; i++) iris_image_free(prepared[i]);
+        free(prepared);
+    }
     if (lat)
         for (int i = 0; i < num_refs; i++) free(lat[i]);
     free(lat);
@@ -1172,10 +1257,11 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         return NULL;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     /* Encode text (and unconditioned text for CFG in base model) */
     int text_seq;
@@ -1318,10 +1404,11 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         return NULL;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
@@ -1406,10 +1493,11 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
     p.height = (p.height / 16) * 16;
     if (p.width < 64) p.width = 64;
     if (p.height < 64) p.height = 64;
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        image_size_error(ctx);
         return NULL;
     }
+    if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
@@ -1487,16 +1575,30 @@ static size_t attention_bytes(int num_heads,
     return (size_t)num_heads * total_seq * total_seq * sizeof(float);
 }
 
-/* Shrink reference pixel dimensions so attention fits under 4 GB.
+/* Shrink reference pixel dimensions so manual attention fits under 4 GiB.
  * ref_dims: [h0, w0, h1, w1, ...] in pixels, modified in-place.
- * Returns 1 if any reference was shrunk, 0 if already fits. */
+ * Returns -1 if the output cannot fit, 1 if shrunk, or 0 if unchanged. */
 static int fit_refs_for_attention(int num_heads,
                                   int out_h, int out_w,
                                   int *ref_dims, int num_refs,
                                   int txt_seq)
 {
+#ifdef IRIS_DEV
+    if (iris_dev_has_memory_efficient_attention() &&
+        !getenv("IRIS_USE_MANUAL_SDPA")) return 0;
+#endif
+#ifdef USE_METAL
+    if (iris_metal_has_memory_efficient_attention()) return 0;
+#endif
+    size_t min_seq = (size_t)(out_h / 16) * (out_w / 16) + txt_seq + num_refs;
+    if ((size_t)num_heads * min_seq * min_seq * sizeof(float) >= ATTENTION_MAX_BYTES) {
+        set_error("Output exceeds the 4 GiB attention budget even with minimum references; "
+                  "reduce output dimensions or use memory-efficient GPU attention "
+                  "(unset IRIS_USE_MANUAL_SDPA)");
+        return -1;
+    }
     if (attention_bytes(num_heads, out_h, out_w,
-                        ref_dims, num_refs, txt_seq) <= ATTENTION_MAX_BYTES)
+                        ref_dims, num_refs, txt_seq) < ATTENTION_MAX_BYTES)
         return 0;
 
     int shrunk = 0;
@@ -1525,7 +1627,7 @@ static int fit_refs_for_attention(int num_heads,
         shrunk = 1;
 
         if (attention_bytes(num_heads, out_h, out_w,
-                            ref_dims, num_refs, txt_seq) <= ATTENTION_MAX_BYTES)
+                            ref_dims, num_refs, txt_seq) < ATTENTION_MAX_BYTES)
             break;
     }
     return shrunk;
@@ -1566,8 +1668,8 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     if (p.height <= 0) p.height = input->height;
 
     /* Clamp to VAE max dimensions, preserving aspect ratio */
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        float scale = (float)IRIS_VAE_MAX_DIM /
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        float scale = (float)ctx->max_width /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
@@ -1576,20 +1678,36 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     /* Ensure divisible by 16 */
     p.width = (p.width / 16) * 16;
     p.height = (p.height / 16) * 16;
-
-    /* Check attention memory budget — shrink reference if needed. */
-    int ref_w = p.width, ref_h = p.height;
+    /* Preserve reference resolution independently of the requested output. */
+    int ref_w = input->width, ref_h = input->height;
+    if (ref_w > ctx->max_width || ref_h > ctx->max_height) {
+        float scale = (float)ctx->max_width / (ref_w > ref_h ? ref_w : ref_h);
+        ref_w = (int)(ref_w * scale);
+        ref_h = (int)(ref_h * scale);
+    }
+    ref_w = ref_w / 16 * 16;
+    ref_h = ref_h / 16 * 16;
+    if (ref_w < 16) ref_w = 16;
+    if (ref_h < 16) ref_h = 16;
     {
-        int ref_dims[2] = { p.height, p.width };
-        if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                    ref_dims, 1, IRIS_MAX_SEQ_LEN)) {
+        int ref_dims[2] = { ref_h, ref_w };
+        int fit = fit_refs_for_attention(ctx->num_heads, p.height, p.width,
+                                         ref_dims, 1, IRIS_MAX_SEQ_LEN);
+        if (fit < 0) return NULL;
+        if (fit > 0) {
             fprintf(stderr, "Note: reference image resized from %dx%d to %dx%d "
                     "(GPU attention memory limit)\n",
-                    p.width, p.height, ref_dims[1], ref_dims[0]);
+                    ref_w, ref_h, ref_dims[1], ref_dims[0]);
             ref_h = ref_dims[0];
             ref_w = ref_dims[1];
         }
     }
+    if (iris_phase_callback)
+        fprintf(stderr, "Reference image: %dx%d (output %dx%d)\n",
+                ref_w, ref_h, p.width, p.height);
+    if ((size_t)ref_w * ref_h > (size_t)p.width * p.height) {
+        if (!prepare_vae(ctx, ref_w, ref_h)) return NULL;
+    } else if (!prepare_vae(ctx, p.width, p.height)) return NULL;
 
     /* Resize input if needed */
     iris_image *resized = NULL;
@@ -1787,8 +1905,8 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     if (p.height <= 0) p.height = refs[0]->height;
 
     /* Clamp to VAE max dimensions */
-    if (p.width > IRIS_VAE_MAX_DIM || p.height > IRIS_VAE_MAX_DIM) {
-        float scale = (float)IRIS_VAE_MAX_DIM /
+    if (p.width > ctx->max_width || p.height > ctx->max_height) {
+        float scale = (float)ctx->max_width /
                       (p.width > p.height ? p.width : p.height);
         p.width = (int)(p.width * scale);
         p.height = (int)(p.height * scale);
@@ -1801,10 +1919,47 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
     float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
 
+    /* Build reference pixel dimensions, clamped and rounded to 16. */
+    int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
+    for (int i = 0; i < num_refs; i++) {
+        int rh = (refs[i]->height / 16) * 16;
+        int rw = (refs[i]->width / 16) * 16;
+        if (rh > ctx->max_height) rh = ctx->max_height;
+        if (rw > ctx->max_width) rw = ctx->max_width;
+        if (rh < 16) rh = 16;
+        if (rw < 16) rw = 16;
+        ref_pixel_dims[i*2]   = rh;
+        ref_pixel_dims[i*2+1] = rw;
+    }
+
+    /* Reject impossible manual budgets before encoding or loading weights. */
+    int fit = fit_refs_for_attention(ctx->num_heads, p.height, p.width,
+                                     ref_pixel_dims, num_refs, IRIS_MAX_SEQ_LEN);
+    if (fit < 0) {
+        free(ref_pixel_dims);
+        return NULL;
+    }
+    if (fit > 0) {
+        fprintf(stderr,
+                "Note: reference images resized to fit GPU attention "
+                "memory limit\n");
+    }
+
+    int max_w = p.width, max_h = p.height;
+    for (int i = 0; i < num_refs; i++) {
+        int rh = ref_pixel_dims[i*2], rw = ref_pixel_dims[i*2+1];
+        if ((size_t)rh * rw > (size_t)max_h * max_w) { max_h = rh; max_w = rw; }
+    }
+    if (!prepare_vae(ctx, max_w, max_h)) {
+        free(ref_pixel_dims);
+        return NULL;
+    }
+
     /* Encode text */
     int text_seq;
     float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
     if (!text_emb) {
+        free(ref_pixel_dims);
         set_error("Failed to encode prompt");
         return NULL;
     }
@@ -1815,6 +1970,7 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         text_emb_uncond = iris_encode_text(ctx, "", &text_seq_uncond);
         if (!text_emb_uncond) {
             free(text_emb);
+            free(ref_pixel_dims);
             set_error("Failed to encode empty prompt for CFG");
             return NULL;
         }
@@ -1825,28 +1981,8 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
     if (!iris_load_transformer_if_needed(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
+        free(ref_pixel_dims);
         return NULL;
-    }
-
-    /* Build reference pixel dimensions, clamped and rounded to 16. */
-    int *ref_pixel_dims = (int *)malloc(num_refs * 2 * sizeof(int));
-    for (int i = 0; i < num_refs; i++) {
-        int rh = (refs[i]->height / 16) * 16;
-        int rw = (refs[i]->width / 16) * 16;
-        if (rh > IRIS_VAE_MAX_DIM) rh = IRIS_VAE_MAX_DIM;
-        if (rw > IRIS_VAE_MAX_DIM) rw = IRIS_VAE_MAX_DIM;
-        if (rh < 16) rh = 16;
-        if (rw < 16) rw = 16;
-        ref_pixel_dims[i*2]   = rh;
-        ref_pixel_dims[i*2+1] = rw;
-    }
-
-    /* Shrink references if attention would exceed 4 GB. */
-    if (fit_refs_for_attention(ctx->num_heads, p.height, p.width,
-                                ref_pixel_dims, num_refs, IRIS_MAX_SEQ_LEN)) {
-        fprintf(stderr,
-                "Note: reference images resized to fit GPU attention "
-                "memory limit\n");
     }
 
     /* Encode all reference images */

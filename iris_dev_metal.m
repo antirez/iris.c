@@ -329,6 +329,11 @@ int iris_dev_init(void) {
 }
 
 int iris_dev_available(void) { return g_ready; }
+
+int iris_dev_has_memory_efficient_attention(void) {
+    return g_ready && [MPSGraph instancesRespondToSelector:
+        @selector(scaledDotProductAttentionWithQueryTensor:keyTensor:valueTensor:scale:name:)];
+}
 const char *iris_dev_name(void) { return g_name; }
 
 /* Commit the open command buffer and wait for it. */

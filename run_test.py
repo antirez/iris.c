@@ -5,6 +5,7 @@ Usage: python3 run_test.py [--binary PATH] [--full]
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,48 @@ TESTS = [
     },
 ]
 
+TESTS.extend([
+    {
+        "name": "FLUX.2 reference resolution independent of output",
+        "prompt": "Create an exact copy of the input image.",
+        "seed": 42, "steps": 2, "width": 64, "height": 64,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images"],
+        "expect_stderr": "Reference image: 256x256 (output 64x64)",
+    },
+    {
+        "name": "FLUX.2 rejects impossible single-reference manual budget",
+        "prompt": "Create an exact copy of the input image.",
+        "seed": 42, "steps": 1, "width": 1920, "height": 1280,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images"],
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
+        "expect_error": "Output exceeds the 4 GiB attention budget",
+        "reject_stderr": "VAE working buffers",
+    },
+    {
+        "name": "FLUX.2 rejects impossible multi-reference manual budget",
+        "prompt": "Create an exact copy of the input images.",
+        "seed": 42, "steps": 1, "width": 1920, "height": 1280,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images", "-i", "test_vectors/img2img_input_256x256.png"],
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
+        "expect_error": "Output exceeds the 4 GiB attention budget",
+        "reject_stderr": "VAE working buffers",
+    },
+    dict(TESTS[0], name="FLUX.2 manual attention numerical parity",
+         env={"IRIS_USE_MANUAL_SDPA": "1"}),
+    {
+        "name": "FLUX.2 multiple references with native attention",
+        "prompt": "Create an exact copy of the input images.",
+        "seed": 42, "steps": 1, "width": 64, "height": 64,
+        "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images", "-i", "test_vectors/img2img_input_256x256.png"],
+        "expect_stderr": "VAE working buffers for 256x256: 0.38 GiB",
+    },
+])
+
+
 # Full-only tests: these are slow and require visual inspection.
 FULL_TESTS = [
     {
@@ -64,6 +107,7 @@ FULL_TESTS = [
         "width": 1024,
         "height": 1024,
         "expect_stderr": "reference image resized",
+        "env": {"IRIS_USE_MANUAL_SDPA": "1"},
         "visual_check": "a blue sports car on a rainy city street at night, "
                         "output is 1024x1024",
     },
@@ -108,6 +152,48 @@ FLUX3_TESTS = [
         "mean_diff_threshold": 20,
     },
 ]
+
+# Exercise request-sized buffers against the same numerical references.
+FLUX3_TESTS.extend([
+    dict(FLUX3_TESTS[0], name="FLUX.3 request-sized txt2img buffers",
+         extra_args=["--allow-large-images"],
+         expect_stderr="VAE working buffers for 256x256: 0.38 GiB"),
+    dict(FLUX3_TESTS[1], name="FLUX.3 request-sized reference buffers",
+         extra_args=["--allow-large-images"]),
+    dict(FLUX3_TESTS[0], name="FLUX.3 default ceiling rejects large output",
+         width=1808, height=64, expect_error="Image dimensions exceed maximum (1792x1792)"),
+    {
+        "name": "FLUX.3 opt-in output above 1792 pixels",
+        "prompt": "A simple geometric logo", "seed": 42, "steps": 1,
+        "width": 1808, "height": 64,
+        "extra_args": ["--allow-large-images"],
+        "expect_stderr": "VAE working buffers for 1808x64: 0.66 GiB",
+    },
+    dict(FLUX3_TESTS[0], name="FLUX.3 rejects overflowing VAE tensor size",
+         width=4096, height=4096, extra_args=["--allow-large-images"],
+         expect_error="Image dimensions exceed supported VAE tensor size"),
+    {
+        "name": "FLUX.3 reference larger than output with request-sized buffers",
+        "prompt": "Create an exact copy of the input image.", "seed": 42, "steps": 1,
+        "width": 64, "height": 64, "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images"],
+        "expect_stderr": "VAE working buffers for 256x256: 0.38 GiB",
+    },
+    {
+        "name": "FLUX.3 multiple references reuse one VAE capacity",
+        "prompt": "Create an exact copy of the input image.", "seed": 42, "steps": 1,
+        "width": 64, "height": 64, "input": "test_vectors/img2img_input_256x256.png",
+        "extra_args": ["--allow-large-images", "-i", "test_vectors/img2img_input_256x256.png"],
+        "expect_stderr": "VAE working buffers for 256x256: 0.38 GiB",
+    },
+    {
+        "name": "FLUX.3 quiet mode suppresses memory estimates",
+        "prompt": "A simple geometric logo", "seed": 42, "steps": 1,
+        "width": 64, "height": 64,
+        "extra_args": ["--allow-large-images", "--quiet"],
+        "reject_stderr": "VAE working buffers",
+    },
+])
 
 
 def is_flux3_model_dir(model_dir: Path) -> bool:
@@ -173,19 +259,34 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         "-H", str(test["height"]),
         "-o", output_path,
     ]
+    cmd.extend(test.get("extra_args", []))
 
     # Add input image for img2img tests
     if "input" in test:
         cmd.extend(["-i", test["input"]])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                                env={**os.environ, **test.get("env", {})})
+        if "expect_error" in test:
+            if result.returncode != 1:
+                return False, f"expected clean rejection (exit 1), got {result.returncode}"
+            if test["expect_error"] not in result.stderr:
+                return False, f"expected '{test['expect_error']}', got: {result.stderr}"
+            if "reject_stderr" in test and test["reject_stderr"] in result.stderr:
+                return False, f"unexpected '{test['reject_stderr']}' before rejection"
+            return True, "request rejected as expected"
         if result.returncode != 0:
             return False, f"process exited with code {result.returncode}: {result.stderr}"
     except subprocess.TimeoutExpired:
         return False, "timeout (300s)"
     except FileNotFoundError:
         return False, f"binary not found: {binary}"
+
+    if "expect_stderr" in test and test["expect_stderr"] not in result.stderr:
+        return False, f"expected '{test['expect_stderr']}' in stderr but not found"
+    if "reject_stderr" in test and test["reject_stderr"] in result.stderr:
+        return False, f"unexpected '{test['reject_stderr']}' in stderr"
 
     # If the test has no reference image, it's a visual-check-only test.
     if "reference" not in test:
@@ -197,12 +298,6 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         if out.width != test["width"] or out.height != test["height"]:
             return False, (f"wrong output size: {out.width}x{out.height}, "
                            f"expected {test['width']}x{test['height']}")
-
-        # Check expected stderr substring (e.g. the resize note).
-        if "expect_stderr" in test:
-            if test["expect_stderr"] not in result.stderr:
-                return False, (f"expected '{test['expect_stderr']}' in "
-                               f"stderr but not found")
 
         return True, f"output saved to {output_path}"
 

@@ -199,6 +199,14 @@ static double timer_end(void) {
            (now.tv_usec - timer_start_tv.tv_usec) / 1000000.0;
 }
 
+static void cli_vae_memory(int width, int height, size_t bytes) {
+    if (cli_current_phase) fprintf(stderr, "\n");
+    fprintf(stderr, "VAE working buffers for %dx%d: %.2f GiB "
+                    "(model and GPU memory additional)\n",
+            width, height, (double)bytes / (1024.0 * 1024 * 1024));
+    fflush(stderr);
+}
+
 /* ========================================================================
  * Output Helpers
  * ======================================================================== */
@@ -254,6 +262,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
+    fprintf(stderr, "      --allow-large-images Allocate VAE buffers for requested sizes above 1792\n");
     fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
     fprintf(stderr, "      --blas-threads N  Set number of BLAS threads (OpenBLAS only)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
@@ -303,6 +312,7 @@ int main(int argc, char *argv[]) {
         {"power-alpha",required_argument, 0, 257},
         {"sigmoid",    no_argument,       0, 260},
         {"flowmatch",  no_argument,       0, 261},
+        {"allow-large-images", no_argument, 0, 262},
         {"debug-py",   no_argument,       0, 'D'},
         {"no-license-info", no_argument, 0, 258},
         {"blas-threads",required_argument, 0, 259},
@@ -334,6 +344,7 @@ int main(int argc, char *argv[]) {
     int debug_py = 0;
     int force_base = 0;
     int no_license_info = 0;
+    int allow_large_images = 0;
     int blas_threads = 0; (void)blas_threads;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
@@ -375,6 +386,7 @@ int main(int argc, char *argv[]) {
             case 257: params.power_alpha = atof(optarg); params.schedule = IRIS_SCHEDULE_POWER; break;
             case 260: params.schedule = IRIS_SCHEDULE_SIGMOID; break;
             case 261: params.schedule = IRIS_SCHEDULE_FLOWMATCH; break;
+            case 262: allow_large_images = 1; break;
             case 258: no_license_info = 1; break;
             case 'D': debug_py = 1; break;
             case 259: blas_threads = atoi(optarg); break;
@@ -496,7 +508,9 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    iris_ctx *ctx = iris_load_dir(model_dir);
+    if (allow_large_images && output_level >= OUTPUT_NORMAL)
+        iris_vae_memory_callback = cli_vae_memory;
+    iris_ctx *ctx = iris_load_dir_ex(model_dir, allow_large_images);
     if (!ctx) {
         fprintf(stderr, "\nError: Failed to load model: %s\n", iris_get_error());
         return 1;

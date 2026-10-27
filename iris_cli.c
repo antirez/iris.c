@@ -159,7 +159,8 @@ static char *parse_size(const char *s, int *w, int *h) {
     char *mid = end + 1;
     long lh = strtol(mid, &end, 10);
     if (end == mid) return NULL;
-    if (lw < 64 || lw > 1792 || lh < 64 || lh > 1792) return NULL;
+    int limit = iris_max_image_dimension(state.ctx);
+    if (lw < 64 || lw > limit || lh < 64 || lh > limit) return NULL;
     *w = (int)lw;
     *h = (int)lh;
     return end;

@@ -284,6 +284,10 @@ extern iris_step_callback_t iris_step_callback;
 typedef void (*iris_phase_callback_t)(const char *phase, int done);
 extern iris_phase_callback_t iris_phase_callback;
 
+/* Called immediately before allocating VAE working buffers; excludes weights
+ * and device memory. Like the other progress callbacks, optional and global. */
+extern void (*iris_vae_memory_callback)(int width, int height, size_t bytes);
+
 /*
  * Step image callback - called after each denoising step with decoded image.
  * step: current step (1-based)

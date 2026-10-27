@@ -144,6 +144,8 @@ extern "C" int iris_dev_init(void) {
 }
 
 extern "C" int iris_dev_available(void) { return g_ready; }
+/* Both flash attention and the GEMM fallback bound the score scratch. */
+extern "C" int iris_dev_has_memory_efficient_attention(void) { return g_ready; }
 extern "C" const char *iris_dev_name(void) { return g_name; }
 
 extern "C" void iris_dev_cleanup(void) {

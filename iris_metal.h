@@ -27,6 +27,10 @@ int iris_metal_init(void);
  */
 int iris_metal_available(void);
 
+/* Native SDPA avoids the manual attention score-matrix allocation limit.
+ * Returns false without Metal or when IRIS_USE_MANUAL_SDPA is set. */
+int iris_metal_has_memory_efficient_attention(void);
+
 /*
  * Cleanup Metal resources.
  */

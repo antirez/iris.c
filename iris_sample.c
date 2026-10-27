@@ -548,6 +548,11 @@ float *iris_sample_euler_refs_flux(void *transformer, void *text_encoder,
                                                       text_emb, text_seq,
                                                       t_curr);
 
+        if (!v) {
+            free(z_curr);
+            return NULL;
+        }
+
         /* Euler step: z_next = z_curr + dt * v */
         iris_axpy(z_curr, dt, v, latent_size);
 
@@ -621,6 +626,11 @@ float *iris_sample_euler_multirefs_flux(void *transformer, void *text_encoder,
                                                             refs, num_refs,
                                                             text_emb, text_seq,
                                                             t_curr);
+
+        if (!v) {
+            free(z_curr);
+            return NULL;
+        }
 
         /* Euler step */
         iris_axpy(z_curr, dt, v, latent_size);
@@ -787,6 +797,13 @@ float *iris_sample_euler_cfg_refs_flux(void *transformer, void *text_encoder,
                             ref_latent, ref_h, ref_w, t_offset,
                             text_emb_cond, text_seq_cond, t_curr);
 
+        if (!v_uncond || !v_cond) {
+            free(v_uncond);
+            free(v_cond);
+            free(z_curr);
+            return NULL;
+        }
+
         /* CFG combine */
         for (int i = 0; i < latent_size; i++) {
             float v = v_uncond[i] + guidance_scale * (v_cond[i] - v_uncond[i]);
@@ -867,6 +884,13 @@ float *iris_sample_euler_cfg_multirefs_flux(void *transformer, void *text_encode
                             z_curr, h, w,
                             refs, num_refs,
                             text_emb_cond, text_seq_cond, t_curr);
+
+        if (!v_uncond || !v_cond) {
+            free(v_uncond);
+            free(v_cond);
+            free(z_curr);
+            return NULL;
+        }
 
         /* CFG combine */
         for (int i = 0; i < latent_size; i++) {

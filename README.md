@@ -452,7 +452,39 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 
 ## Resolution Limits
 
-**Maximum resolution**: 1792x1792 pixels. The model produces good results up to this size; beyond this resolution image quality degrades significantly (this is a model limitation, not an implementation issue).
+**Default maximum resolution**: 1792x1792 pixels. To opt in to larger images
+without rebuilding, use `--allow-large-images` together with the usual output
+dimensions:
+
+```sh
+./iris -d flux-3-klein -i input.png -W 1920 -H 1280 \
+  --allow-large-images -p "Create an exact copy of the input image." -o output.png
+```
+
+With this flag, VAE working buffers are allocated for the requested dimensions
+instead of the default square maximum. Larger prepared references can grow the
+buffers, and subsequent operations reuse their capacity. Normal output reports
+the planned buffer allocation before it happens, for example:
+
+```text
+VAE working buffers for 1920x1280: 14.06 GiB (model and GPU memory additional)
+```
+
+This estimates the three CPU VAE working buffers, not total RAM use. More memory
+is needed for model weights, attention, and GPU operations. Allocation can
+succeed before the OS encounters memory pressure, so this flag does not
+guarantee successful generation or prevent swapping. Model quality limits and
+FLUX.3's reference-area limits still apply.
+
+FLUX.2 keeps the reference's own resolution, independently of the output size,
+when memory-efficient GPU attention is available. Manual attention retains its
+4 GiB budget: references can be reduced to fit, and impossible output budgets
+are rejected instead of continuing with a 16×16 reference. On Metal,
+`IRIS_USE_MANUAL_SDPA=1` forces the conservative manual path for debugging.
+The existing 4096-pixel CLI side limit and tensor indexing limits still apply.
+
+Library callers can opt in with `iris_load_dir_ex(model_dir, 1)`; the existing
+`iris_load_dir(model_dir)` keeps the default behavior.
 
 **Minimum resolution**: 64x64 pixels.
 
