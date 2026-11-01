@@ -10,6 +10,7 @@
 
 #include "iris.h"
 #include "jpeg.h"
+#include "iris_qimage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -948,14 +949,22 @@ int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t s
  * Image Manipulation
  * ======================================================================== */
 
+#define LANCZOS_PI 3.14159265358979323846
+#define LANCZOS_ONE 4194304.0   /* PIL's fixed-point 1.0, 22 bits */
+
+static double lanczos3(double t) {
+    if (t == 0) return 1;
+    if (t <= -3 || t >= 3) return 0;
+    return 3 * sin(LANCZOS_PI * t) * sin(LANCZOS_PI * t / 3) / (LANCZOS_PI * LANCZOS_PI * t * t);
+}
+
 /* Lanczos-3 resampling weights for one axis, the way PIL computes them: the
  * filter support grows with the downscaling factor, so shrinking low-pass
  * filters the image instead of aliasing. For output pixel i, the weights of
- * input pixels start[i] .. start[i] + count[i] - 1 are w[i * ksize ...]. */
-#define LANCZOS_PI 3.14159265358979323846
-
+ * input pixels start[i] .. start[i] + count[i] - 1 are w[i * ksize ...].
+ * With fixed they are multiples of 1 / LANCZOS_ONE, which a float holds exactly. */
 static float *lanczos_weights(int in_size, int out_size, int *ksize_out,
-                              int *start, int *count) {
+                              int *start, int *count, int fixed) {
     double scale = (double)in_size / out_size;
     double fscale = scale < 1.0 ? 1.0 : scale;
     double support = 3.0 * fscale;
@@ -972,16 +981,14 @@ static float *lanczos_weights(int in_size, int out_size, int *ksize_out,
         if (xmax - xmin > ksize) xmax = xmin + ksize;
         double sum = 0;
         for (int x = xmin; x < xmax; x++) {
-            double t = (x - center + 0.5) / fscale;
-            double v = 0;
-            if (t == 0) v = 1;
-            else if (t > -3 && t < 3)
-                v = 3 * sin(LANCZOS_PI * t) * sin(LANCZOS_PI * t / 3) /
-                    (LANCZOS_PI * LANCZOS_PI * t * t);
+            double v = lanczos3((x - center + 0.5) / fscale);
             w[(size_t)i * ksize + (x - xmin)] = (float)v;
             sum += v;
         }
-        if (sum != 0)
+        for (int x = xmin; fixed && sum != 0 && x < xmax; x++)
+            w[(size_t)i * ksize + (x - xmin)] =
+                (float)(lround(lanczos3((x - center + 0.5) / fscale) / sum * LANCZOS_ONE) / LANCZOS_ONE);
+        if (!fixed && sum != 0)
             for (int k = 0; k < xmax - xmin; k++) w[(size_t)i * ksize + k] /= (float)sum;
         start[i] = xmin;
         count[i] = xmax - xmin;
@@ -990,17 +997,27 @@ static float *lanczos_weights(int in_size, int out_size, int *ksize_out,
     return w;
 }
 
+/* One 8-bit resampling step, exactly as PIL: the result of fixed-point weights
+ * rounded and clipped. Halves are common on smooth gradients. */
+static uint8_t lanczos_dot8(const float *w, int n, const uint8_t *src, size_t stride) {
+    int s = 1 << 21;
+    for (int k = 0; k < n; k++) s += (int)(w[k] * (float)LANCZOS_ONE) * src[k * stride];
+    s >>= 22;
+    return (uint8_t)(s < 0 ? 0 : s > 255 ? 255 : s);
+}
+
 /* Resize with Lanczos-3 (separable, antialiased when downscaling, as PIL's
- * LANCZOS filter): horizontal pass into a float buffer, then vertical. */
-iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height) {
+ * LANCZOS filter): horizontal pass into a float buffer, then vertical. With
+ * round8 both passes are PIL's 8-bit ones and tmp holds bytes. */
+static iris_image *resize_lanczos(const iris_image *img, int new_width, int new_height, int round8) {
     if (!img || new_width <= 0 || new_height <= 0) return NULL;
 
     int ch = img->channels;
     int kx, ky;
     int *xs = malloc(new_width * sizeof(int)), *xc = malloc(new_width * sizeof(int));
     int *ys = malloc(new_height * sizeof(int)), *yc = malloc(new_height * sizeof(int));
-    float *wx = (xs && xc) ? lanczos_weights(img->width, new_width, &kx, xs, xc) : NULL;
-    float *wy = (ys && yc) ? lanczos_weights(img->height, new_height, &ky, ys, yc) : NULL;
+    float *wx = (xs && xc) ? lanczos_weights(img->width, new_width, &kx, xs, xc, round8) : NULL;
+    float *wy = (ys && yc) ? lanczos_weights(img->height, new_height, &ky, ys, yc, round8) : NULL;
     float *tmp = malloc((size_t)img->height * new_width * ch * sizeof(float));
     iris_image *resized = iris_image_create(new_width, new_height, ch);
     if (!wx || !wy || !tmp || !resized) {
@@ -1014,6 +1031,11 @@ iris_image *iris_image_resize(const iris_image *img, int new_width, int new_heig
         for (int x = 0; x < new_width; x++) {
             const float *w = wx + (size_t)x * kx;
             for (int c = 0; c < ch; c++) {
+                if (round8) {
+                    ((uint8_t *)tmp)[((size_t)y * new_width + x) * ch + c] =
+                        lanczos_dot8(w, xc[x], row + xs[x] * ch + c, ch);
+                    continue;
+                }
                 float v = 0;
                 for (int k = 0; k < xc[x]; k++) v += w[k] * row[(xs[x] + k) * ch + c];
                 tmp[((size_t)y * new_width + x) * ch + c] = v;
@@ -1023,6 +1045,12 @@ iris_image *iris_image_resize(const iris_image *img, int new_width, int new_heig
     for (int y = 0; y < new_height; y++) {
         const float *w = wy + (size_t)y * ky;
         for (int x = 0; x < new_width * ch; x++) {
+            if (round8) {
+                size_t top = (size_t)ys[y] * new_width * ch + x;
+                resized->data[(size_t)y * new_width * ch + x] =
+                    lanczos_dot8(w, yc[y], (uint8_t *)tmp + top, (size_t)new_width * ch);
+                continue;
+            }
             float v = 0;
             for (int k = 0; k < yc[y]; k++) v += w[k] * tmp[(size_t)(ys[y] + k) * new_width * ch + x];
             v = v < 0 ? 0 : v > 255 ? 255 : v;
@@ -1041,6 +1069,10 @@ done:
     return resized;
 }
 
+iris_image *iris_image_resize(const iris_image *img, int new_width, int new_height) {
+    return resize_lanczos(img, new_width, new_height, 0);
+}
+
 /* Convert image to specific number of channels */
 iris_image *iris_image_convert(const iris_image *img, int new_channels) {
     if (!img || new_channels < 1 || new_channels > 4) return NULL;
@@ -1053,13 +1085,14 @@ iris_image *iris_image_convert(const iris_image *img, int new_channels) {
             const uint8_t *src = img->data + (y * img->width + x) * img->channels;
             uint8_t *dst = converted->data + (y * img->width + x) * new_channels;
 
-            if (img->channels == 1 && new_channels >= 3) {
-                /* Grayscale to RGB(A) */
+            if (img->channels <= 2 && new_channels >= 3) {
+                /* Grayscale (+ alpha) to RGB(A) */
                 dst[0] = dst[1] = dst[2] = src[0];
-                if (new_channels == 4) dst[3] = 255;
-            } else if (img->channels >= 3 && new_channels == 1) {
-                /* RGB to grayscale */
+                if (new_channels == 4) dst[3] = img->channels == 2 ? src[1] : 255;
+            } else if (img->channels >= 3 && new_channels <= 2) {
+                /* RGB(A) to grayscale (+ alpha) */
                 dst[0] = (uint8_t)(0.299f * src[0] + 0.587f * src[1] + 0.114f * src[2]);
+                if (new_channels == 2) dst[1] = img->channels == 4 ? src[3] : 255;
             } else {
                 /* Copy available channels */
                 for (int c = 0; c < new_channels; c++) {
@@ -1074,6 +1107,83 @@ iris_image *iris_image_convert(const iris_image *img, int new_channels) {
     }
 
     return converted;
+}
+
+/* ========================================================================
+ * Qwen-Image reference preparation
+ * ======================================================================== */
+
+/* calculate_dimensions: the aspect of width x height at about area pixels,
+ * on a 32-pixel grid. rint is Python's round (half to even). */
+void iris_ref_size_qimage(int width, int height, int area, int *ref_w, int *ref_h) {
+    double ratio = (double)width / height;
+    double w = sqrt(area * ratio), h = w / ratio;
+    *ref_w = (int)rint(w / 32) * 32;
+    *ref_h = (int)rint(h / 32) * 32;
+}
+
+/* a * b / 255, rounded the way PIL does it. */
+static uint8_t muldiv255(int a, int b) {
+    int t = a * b + 128;
+    return (uint8_t)(((t >> 8) + t) >> 8);
+}
+
+/* An RGBA copy of img at its reference size. Like PIL, an image with
+ * transparency is resized premultiplied, so colour under alpha 0 is lost. */
+iris_image *iris_ref_prepare_qimage(const iris_image *img, int area) {
+    int w, h;
+    iris_ref_size_qimage(img->width, img->height, area, &w, &h);
+    if (w == 0 || h == 0 || (w > h ? w > 200 * h : h > 200 * w)) {
+        fprintf(stderr, "Qwen-Image: unsupported reference aspect %dx%d\n",
+                img->width, img->height);
+        return NULL;
+    }
+    iris_image *rgba = iris_image_convert(img, 4);
+    if (!rgba || (w == rgba->width && h == rgba->height)) return rgba;
+
+    size_t npix = (size_t)rgba->width * rgba->height;
+    int alpha = 0;
+    for (size_t p = 0; p < npix && !alpha; p++) alpha = rgba->data[p * 4 + 3] != 255;
+    for (size_t p = 0; alpha && p < npix; p++) {
+        uint8_t *px = rgba->data + p * 4;
+        for (int c = 0; c < 3; c++) px[c] = muldiv255(px[c], px[3]);
+    }
+    iris_image *resized = resize_lanczos(rgba, w, h, 1);
+    iris_image_free(rgba);
+    for (size_t p = 0; alpha && resized && p < (size_t)w * h; p++) {
+        uint8_t *px = resized->data + p * 4;
+        if (px[3] == 0 || px[3] == 255) continue;
+        for (int c = 0; c < 3; c++) {
+            int v = 255 * px[c] / px[3];
+            px[c] = (uint8_t)(v > 255 ? 255 : v);
+        }
+    }
+    return resized;
+}
+
+/* The vision encoder's RGB copy of a prepared reference: over white. */
+iris_image *iris_ref_vision_qimage(const iris_image *rgba) {
+    iris_image *rgb = iris_image_create(rgba->width, rgba->height, 3);
+    if (!rgb) return NULL;
+    for (size_t p = 0; p < (size_t)rgba->width * rgba->height; p++) {
+        const uint8_t *px = rgba->data + p * 4;
+        for (int c = 0; c < 3; c++) {
+            int t = px[c] * px[3] + 255 * (255 - px[3]) + 128;   /* PIL's blend */
+            rgb->data[p * 3 + c] = (uint8_t)(((t >> 8) + t) >> 8);
+        }
+    }
+    return rgb;
+}
+
+/* The VAE input of a prepared reference: [4, h, w] in [-1, 1] (caller frees). */
+float *iris_ref_pixels_qimage(const iris_image *rgba) {
+    size_t npix = (size_t)rgba->width * rgba->height;
+    float *x = malloc(npix * 4 * sizeof(float));
+    if (!x) return NULL;
+    for (int c = 0; c < 4; c++)
+        for (size_t p = 0; p < npix; p++)
+            x[c * npix + p] = 2.0f * (rgba->data[p * 4 + c] / 255.0f) - 1.0f;
+    return x;
 }
 
 /* strcasecmp for portability */

@@ -110,6 +110,74 @@ FLUX3_TESTS = [
 ]
 
 
+# Optional Qwen-Image 2.1 tests, run only if a Turbo model directory is found
+# (the base model's schedule gives another image). The references were produced
+# by debug/qimage_reference.py (official diffusers components, float32)
+# starting from the noise iris generates for seed 42. Correct txt2img output
+# measures a mean_diff of 0.6, a broken text prefix about 24. Correct edit
+# output measures 0.72 on both backends, and 1e-5 of noise moves it 0.58-0.84.
+# Failing it: a wrong position advance 1.72, one deepstack layer of three 2.04,
+# wrong reference position in the transformer 35. No MRoPE (0.83-0.96) and height
+# and width swapped (0.78-1.03) overlap correct output, no threshold splits them:
+# make ropetest, run before these by make test, checks the positions directly.
+# Deepstack layers in the wrong order give 0.72 and pass: only
+# debug/dump_qimage_e2e.c on BLAS sees that.
+QIMAGE_TESTS = [
+    {
+        "name": "Qwen-Image 2.1 Turbo test (8 steps, 256x256)",
+        "prompt": "A fluffy orange cat sitting on a windowsill",
+        "seed": 42,
+        "steps": 8,
+        "width": 256,
+        "height": 256,
+        "reference": "test_vectors/reference_qimage_turbo_8step_256x256_seed42.png",
+        "mean_diff_threshold": 5,
+    },
+    {
+        "name": "Qwen-Image 2.1 Turbo edit test (8 steps, 512x512)",
+        "prompt": "Same woman, same pose, as a watercolor painting",
+        "seed": 42,
+        "steps": 8,
+        "width": 512,
+        "height": 512,
+        "input": "test_vectors/qimage_edit_input_384x512.png",
+        "reference": "test_vectors/reference_qimage_turbo_edit_8step_512x512_seed42.png",
+        "mean_diff_threshold": 1,
+    },
+    {
+        # 2100 encoder tokens, past the native Metal kernels. Correct output
+        # measures 1.86 on Metal and 3.42 on CUDA, and two references make the
+        # result depend on the rounding: changing the noise by 1e-5 gives 1.4-2.6
+        # on Metal and 1.3-5.3 on CUDA with the same per-step error.
+        # Failing it: no position advance after the second reference 9.4
+        # (transformer) and 13 (encoder), no deepstack on the device path 12,
+        # wrong reference frame 27, device encoder not causal or with the wrong
+        # GQA groups 95. Exact GELU in the vision blocks gives 5.95 and passes:
+        # debug/dump_qimage_vision.c sees that.
+        "name": "Qwen-Image 2.1 Turbo two references test (8 steps, 256x256)",
+        "prompt": "The woman from the first image holds the cat from the second image",
+        "seed": 42,
+        "steps": 8,
+        "width": 256,
+        "height": 256,
+        "inputs": ["test_vectors/qimage_edit_input_384x512.png",
+                   "test_vectors/img2img_input_256x256.png"],
+        "reference": "test_vectors/reference_qimage_turbo_tworef_8step_256x256_seed42.png",
+        "mean_diff_threshold": 6,
+    },
+]
+
+
+def is_qimage_turbo_model_dir(model_dir: Path) -> bool:
+    """Return True if model_dir looks like a Qwen-Image 2.1 Turbo model directory."""
+    model_index = model_dir / "model_index.json"
+    try:
+        text = model_index.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "QwenImage21Pipeline" in text and "sample_sigmas" in text
+
+
 def is_flux3_model_dir(model_dir: Path) -> bool:
     """Return True if model_dir looks like a FLUX.3 model directory."""
     config = model_dir / "transformer" / "config.json"
@@ -174,9 +242,9 @@ def run_test(binary: str, test: dict, model_dir: str) -> tuple[bool, str]:
         "-o", output_path,
     ]
 
-    # Add input image for img2img tests
-    if "input" in test:
-        cmd.extend(["-i", test["input"]])
+    # Add input images for img2img tests
+    for path in test.get("inputs", [test["input"]] if "input" in test else []):
+        cmd.extend(["-i", path])
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -235,6 +303,8 @@ def main():
                         help="Optional Z-Image model dir (auto-detected if omitted)")
     parser.add_argument("--flux3-model-dir", default=None,
                         help="Optional FLUX.3 model dir (auto-detected if omitted)")
+    parser.add_argument("--qimage-model-dir", default=None,
+                        help="Optional Qwen-Image 2.1 Turbo model dir (auto-detected if omitted)")
     parser.add_argument("--quick", action="store_true", help="Run only the quick 64x64 test")
     parser.add_argument("--full", action="store_true",
                         help="Also run slow tests that require visual inspection")
@@ -246,13 +316,15 @@ def main():
         tests_to_run = list(TESTS)
     full_tests_to_run = list(FULL_TESTS) if args.full else []
 
-    # Optional Z-Image and FLUX.3 coverage: run only in non-quick mode.
+    # Optional Z-Image, FLUX.3 and Qwen-Image coverage: run only in non-quick mode.
     scheduled_tests: list[tuple[dict, str]] = [(t, args.model_dir) for t in tests_to_run]
     optional = [
         ("Z-Image", "--zimage-model-dir", args.zimage_model_dir, [ZIMAGE_SMOKE_TEST],
          ("zimage-turbo", "zimage", "Z-Image-Turbo"), is_zimage_model_dir),
         ("FLUX.3", "--flux3-model-dir", args.flux3_model_dir, FLUX3_TESTS,
          ("flux-3-klein", "flux-3-klein-base"), is_flux3_model_dir),
+        ("Qwen-Image", "--qimage-model-dir", args.qimage_model_dir, QIMAGE_TESTS,
+         ("qwen-image-2.1-turbo",), is_qimage_turbo_model_dir),
     ]
     for label, flag, explicit, tests, names, matches in optional:
         if args.quick:

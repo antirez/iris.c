@@ -10,7 +10,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <limits.h>
 #include "iris_kernels.h"
+#include "iris_nfc_table.h"
 
 /* ========================================================================
  * Configuration
@@ -24,6 +26,9 @@
 /* Special token IDs */
 #define QWEN3_PAD_ID 151643      /* <|endoftext|> */
 #define QWEN3_IM_START_ID 151644 /* <|im_start|> */
+#define QWEN3_VISION_START_ID 151652 /* <|vision_start|> */
+#define QWEN3_VISION_END_ID 151653   /* <|vision_end|> */
+#define QWEN3_IMAGE_PAD_ID 151655    /* <|image_pad|> */
 #define QWEN3_IM_END_ID 151645   /* <|im_end|> */
 #define QWEN3_THINK_START_ID 151667 /* <think> */
 #define QWEN3_THINK_END_ID 151668   /* </think> */
@@ -58,6 +63,10 @@ typedef struct qwen3_tokenizer {
 
     /* Merge rank lookup: "left right" -> rank */
     int *merge_ranks;  /* Hash table: hash("left right") -> rank, or -1 */
+
+    /* added_tokens ids: matched verbatim in the text, before anything else */
+    int *added_ids;
+    int num_added;
 } qwen3_tokenizer_t;
 
 /* ========================================================================
@@ -583,6 +592,9 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
                                 if (id > max_id) max_id = id;
                                 content = NULL;  /* Don't free */
                             }
+                            tok->added_ids = realloc(tok->added_ids,
+                                                     (tok->num_added + 1) * sizeof(int));
+                            tok->added_ids[tok->num_added++] = id;
                         }
                     }
                     free(content);
@@ -643,6 +655,7 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok) {
     }
 
     free(tok->merge_ranks);
+    free(tok->added_ids);
     free(tok);
 }
 
@@ -805,7 +818,7 @@ static char *text_to_bytes(const char *text) {
 }
 
 /* ========================================================================
- * Pre-tokenization (Qwen2 regex split)
+ * Unicode normalization (NFC), the tokenizer's normalizer
  * ======================================================================== */
 
 /* Decode the UTF-8 character at s, storing its length (1 for invalid bytes). */
@@ -822,19 +835,131 @@ static uint32_t utf8_decode(const char *s, int *len) {
     return c;
 }
 
+static int utf8_encode(uint32_t c, char *out) {
+    if (c < 0x80) {
+        out[0] = (char)c;
+        return 1;
+    }
+    int n = c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    for (int i = n - 1; i > 0; i--, c >>= 6) out[i] = (char)(0x80 | (c & 0x3F));
+    out[0] = (char)(((0xFF00 >> n) & 0xFF) | c);
+    return n;
+}
+
+static int nfc_combining_class(uint32_t c) {
+    int lo = 0, hi = (int)(sizeof(nfc_class) / sizeof(nfc_class[0])) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (c < nfc_class[mid].first) hi = mid - 1;
+        else if (c > nfc_class[mid].last) lo = mid + 1;
+        else return nfc_class[mid].ccc;
+    }
+    return 0;
+}
+
+/* Hangul syllables are algorithmic: S = S0 + (L * NV + V) * NT + T. */
+#define NFC_S0 0xAC00
+#define NFC_L0 0x1100
+#define NFC_V0 0x1161
+#define NFC_T0 0x11A7
+#define NFC_NV 21
+#define NFC_NT 28
+#define NFC_NS (19 * NFC_NV * NFC_NT)
+
+/* Append the full canonical decomposition of c to out[n], return the new n. */
+static int nfc_decompose(uint32_t c, uint32_t *out, int n) {
+    if (c - NFC_S0 < NFC_NS) {
+        uint32_t s = c - NFC_S0;
+        out[n++] = NFC_L0 + s / (NFC_NV * NFC_NT);
+        out[n++] = NFC_V0 + s / NFC_NT % NFC_NV;
+        if (s % NFC_NT) out[n++] = NFC_T0 + s % NFC_NT;
+        return n;
+    }
+    int lo = 0, hi = (int)(sizeof(nfc_decomp) / sizeof(nfc_decomp[0])) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (c < nfc_decomp[mid].cp) hi = mid - 1;
+        else if (c > nfc_decomp[mid].cp) lo = mid + 1;
+        else {
+            n = nfc_decompose(nfc_decomp[mid].first, out, n);
+            return nfc_decomp[mid].second ? nfc_decompose(nfc_decomp[mid].second, out, n) : n;
+        }
+    }
+    out[n++] = c;
+    return n;
+}
+
+/* Primary composite of a + b, 0 if none. No second character is below U+0300,
+ * which keeps plain text from scanning the table. */
+static uint32_t nfc_compose(uint32_t a, uint32_t b) {
+    if (a - NFC_L0 < 19 && b - NFC_V0 < NFC_NV)
+        return NFC_S0 + ((a - NFC_L0) * NFC_NV + (b - NFC_V0)) * NFC_NT;
+    if (a - NFC_S0 < NFC_NS && (a - NFC_S0) % NFC_NT == 0 && b - NFC_T0 - 1 < NFC_NT - 1)
+        return a + (b - NFC_T0);
+    if (b < 0x300) return 0;
+    for (size_t i = 0; i < sizeof(nfc_decomp) / sizeof(nfc_decomp[0]); i++)
+        if (nfc_decomp[i].composes && nfc_decomp[i].first == a && nfc_decomp[i].second == b)
+            return nfc_decomp[i].cp;
+    return 0;
+}
+
+/* NFC of the first len bytes of text. Caller frees. */
+static char *nfc_normalize(const char *text, size_t len) {
+    /* One byte per character at worst, each decomposing to at most 4. */
+    uint32_t *cp = malloc((len + 1) * 4 * sizeof(uint32_t));
+    char *out = malloc(len * 4 + 1);
+    int n = 0, step;
+    for (size_t i = 0; i < len; i += step) n = nfc_decompose(utf8_decode(text + i, &step), cp, n);
+
+    /* Canonical order: sort each run of combining marks by class. */
+    for (int i = 1; i < n; i++) {
+        uint32_t c = cp[i];
+        int k = nfc_combining_class(c), j = i;
+        for (; k && j > 0 && nfc_combining_class(cp[j - 1]) > k; j--) cp[j] = cp[j - 1];
+        cp[j] = c;
+    }
+
+    /* Compose each character into the last starter unless a character in
+     * between has a class of 0 or at least its own. */
+    int kept = 0, starter = -1, last = -1;
+    for (int i = 0; i < n; i++) {
+        int k = nfc_combining_class(cp[i]);
+        uint32_t c = starter >= 0 && (last < 0 || last < k) ? nfc_compose(cp[starter], cp[i]) : 0;
+        if (c) {
+            cp[starter] = c;
+            continue;
+        }
+        if (k == 0) starter = kept;
+        last = k ? k : -1;
+        cp[kept++] = cp[i];
+    }
+
+    size_t bytes = 0;
+    for (int i = 0; i < kept; i++) bytes += utf8_encode(cp[i], out + bytes);
+    out[bytes] = '\0';
+    free(cp);
+    return out;
+}
+
+/* ========================================================================
+ * Pre-tokenization (Qwen2 regex split)
+ * ======================================================================== */
+
 /* \p{N}: exact for ASCII and Latin-1 (superscripts, fractions). */
 static int cp_is_number(uint32_t c) {
     return (c >= '0' && c <= '9') || c == 0xB2 || c == 0xB3 || c == 0xB9 ||
            (c >= 0xBC && c <= 0xBE) || (c >= 0xFF10 && c <= 0xFF19);
 }
 
-/* \p{L}: exact for ASCII and Latin-1. Above, the punctuation and symbol
- * blocks found in prompts (dashes, quotes, ellipsis, arrows, math, CJK
- * and fullwidth punctuation, emoji) are not letters, the rest is. */
+/* \p{L}: exact for ASCII and Latin-1. Above, combining marks and the
+ * punctuation and symbol blocks found in prompts (dashes, quotes, ellipsis,
+ * arrows, math, CJK and fullwidth punctuation, emoji) are not letters, the
+ * rest is. */
 static int cp_is_letter(uint32_t c) {
     if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     if (c < 0x100) return c == 0xAA || c == 0xB5 || c == 0xBA ||
                           (c >= 0xC0 && c != 0xD7 && c != 0xF7);
+    if (nfc_combining_class(c)) return 0;
     if (c >= 0xFF00 && c <= 0xFF65)
         return (c >= 0xFF21 && c <= 0xFF3A) || (c >= 0xFF41 && c <= 0xFF5A);
     return !((c >= 0x2000 && c <= 0x2BFF) || (c >= 0x3000 && c <= 0x303F) ||
@@ -935,48 +1060,79 @@ static char **pretokenize(const char *text, int *num_chunks) {
  * Main Tokenization API
  * ======================================================================== */
 
+/* Append n token ids to the growable array tokens[*total], *capacity. */
+static int *append_tokens(int *tokens, int *total, int *capacity, const int *ids, int n) {
+    if (*total + n > *capacity) {
+        while (*total + n > *capacity) *capacity *= 2;
+        tokens = realloc(tokens, *capacity * sizeof(int));
+    }
+    memcpy(tokens + *total, ids, n * sizeof(int));
+    *total += n;
+    return tokens;
+}
+
+/* Normalize, pre-tokenize and BPE the len bytes of text between added tokens. */
+static int *tokenize_piece(qwen3_tokenizer_t *tok, const char *text, size_t len, int *tokens,
+                           int *total, int *capacity, int max_len) {
+    char *normal = nfc_normalize(text, len);
+    int num_chunks;
+    char **chunks = pretokenize(normal, &num_chunks);
+    free(normal);
+
+    for (int c = 0; c < num_chunks; c++) {
+        /* Convert to byte-level encoding, apply BPE, convert to token IDs */
+        char *byte_text = text_to_bytes(chunks[c]);
+        token_node_t *bpe_tokens = byte_text ? bpe_encode_word(tok, byte_text) : NULL;
+        for (token_node_t *node = bpe_tokens; node && *total < max_len; node = node->next) {
+            int id = vocab_hash_lookup(tok->vocab_hash, tok->hash_size, node->text);
+            if (id >= 0) tokens = append_tokens(tokens, total, capacity, &id, 1);
+        }
+        free_token_list(bpe_tokens);
+        free(byte_text);
+        free(chunks[c]);
+    }
+    free(chunks);
+    return tokens;
+}
+
+/* Length of the longest added token at s (0 if none), and its id. */
+static size_t added_token_at(const qwen3_tokenizer_t *tok, const char *s, int *id) {
+    size_t best = 0;
+    for (int i = 0; i < tok->num_added; i++) {
+        const char *content = tok->vocab[tok->added_ids[i]];
+        size_t len = strlen(content);
+        if (len > best && strncmp(s, content, len) == 0) {
+            best = len;
+            *id = tok->added_ids[i];
+        }
+    }
+    return best;
+}
+
 /*
- * Tokenize text to token IDs.
+ * Tokenize text to token IDs, as the reference does: added tokens split the
+ * text and stay as they are, the pieces between them go through NFC, the
+ * pre-tokenizer and BPE.
  * Returns array of token IDs, caller must free.
  */
 int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
                     int *num_tokens, int max_len) {
     if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
 
-    /* Pre-tokenize */
-    int num_chunks;
-    char **chunks = pretokenize(text, &num_chunks);
-
-    /* Tokenize each chunk */
     int capacity = 256;
     int *tokens = malloc(capacity * sizeof(int));
     int total = 0;
 
-    for (int c = 0; c < num_chunks && total < max_len; c++) {
-        /* Convert to byte-level encoding */
-        char *byte_text = text_to_bytes(chunks[c]);
-        if (!byte_text) continue;
-
-        /* Apply BPE */
-        token_node_t *bpe_tokens = bpe_encode_word(tok, byte_text);
-
-        /* Convert to token IDs */
-        for (token_node_t *node = bpe_tokens; node && total < max_len; node = node->next) {
-            int id = vocab_hash_lookup(tok->vocab_hash, tok->hash_size, node->text);
-            if (id >= 0) {
-                if (total >= capacity) {
-                    capacity *= 2;
-                    tokens = realloc(tokens, capacity * sizeof(int));
-                }
-                tokens[total++] = id;
-            }
-        }
-
-        free_token_list(bpe_tokens);
-        free(byte_text);
-        free(chunks[c]);
+    while (*text) {
+        const char *end = text;
+        size_t added = 0;
+        int id = 0;
+        while (*end && !(added = added_token_at(tok, end, &id))) end++;
+        tokens = tokenize_piece(tok, text, (size_t)(end - text), tokens, &total, &capacity,
+                                max_len);
+        if (added && total < max_len) tokens = append_tokens(tokens, &total, &capacity, &id, 1);
+        text = end + added;
     }
-    free(chunks);
 
     *num_tokens = total;
     return tokens;
@@ -990,6 +1146,11 @@ int *qwen3_tokenize(qwen3_tokenizer_t *tok, const char *text,
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len, int skip_think_tags) {
     if (max_len <= 0) max_len = QWEN3_MAX_SEQ_LEN;
+
+    /* Tokenize everything and cut at the end, so a truncation can say how
+     * many tokens were lost. */
+    int limit = max_len;
+    max_len = INT_MAX;
 
     int capacity = 256;
     int *tokens = malloc(capacity * sizeof(int));
@@ -1098,6 +1259,130 @@ int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
         free(think_newlines);
     }
 
+    if (total > limit) {
+        /* Leading newline: the one-shot CLI is mid-line on "Encoding text...". */
+        fprintf(stderr, "\nWarning: prompt truncated from %d to %d tokens "
+                "(text encoder limit)\n", total, limit);
+        total = limit;
+    }
+
+    *num_tokens = total;
+    return tokens;
+}
+
+/* Tokenize the raw template (Qwen-Image 2.1, no <think> block)
+ *   <|im_start|>system\n{system}<|im_end|>\n
+ *   <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+ * Each role header is tokenized together with its text, as the reference
+ * tokenizes the whole string (the special tokens split it). num_system
+ * receives the length of the system block, which callers drop from the
+ * encoder output. An empty prompt becomes " ". Over max_len tokens the
+ * end of the prompt is cut, keeping the template tail. */
+int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, int *num_tokens,
+                                int *num_system, int max_len) {
+    static const int im_start = QWEN3_IM_START_ID, im_end = QWEN3_IM_END_ID;
+    if (!prompt[0]) prompt = " ";
+
+    size_t sys_len = strlen(system), prompt_len = strlen(prompt);
+    char *sys_text = malloc(sys_len + 8);
+    char *user_text = malloc(prompt_len + 8);
+    sprintf(sys_text, "system\n%s", system);
+    sprintf(user_text, "user\n%s", prompt);
+
+    int n_sys, n_user, n_nl, n_asst;
+    int *sys_ids = qwen3_tokenize(tok, sys_text, &n_sys, INT_MAX);
+    int *user_ids = qwen3_tokenize(tok, user_text, &n_user, INT_MAX);
+    int *nl_ids = qwen3_tokenize(tok, "\n", &n_nl, INT_MAX);
+    int *asst_ids = qwen3_tokenize(tok, "assistant\n", &n_asst, INT_MAX);
+    free(sys_text);
+    free(user_text);
+
+    /* Fixed parts around the user text: the system block, the user
+     * <|im_start|>, then <|im_end|>\n<|im_start|>assistant\n. */
+    int fixed = (2 + n_sys + n_nl) + 1 + (1 + n_nl + 1 + n_asst);
+    int total_full = fixed + n_user;
+    if (total_full > max_len) {
+        int keep = max_len - fixed;
+        if (keep < 1) keep = 1;
+        fprintf(stderr, "\nWarning: prompt truncated from %d to %d tokens "
+                "(text encoder limit)\n", total_full, fixed + keep);
+        n_user = keep;
+    }
+
+    int capacity = 256, total = 0;
+    int *tokens = malloc(capacity * sizeof(int));
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, sys_ids, n_sys);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    *num_system = total;
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, user_ids, n_user);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, asst_ids, n_asst);
+
+    free(sys_ids);
+    free(user_ids);
+    free(nl_ids);
+    free(asst_ids);
+    *num_tokens = total;
+    return tokens;
+}
+
+/* qwen3_tokenize_chat_system with images in the user turn. Each piece between
+ * special tokens is tokenized on its own, <imageN> is literal text and the
+ * prompt no longer joins the role header. */
+int *qwen3_tokenize_chat_images(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, const int *slots, int n,
+                                int *num_tokens, int *num_system, int *image_rows) {
+    static const int im_start = QWEN3_IM_START_ID, im_end = QWEN3_IM_END_ID;
+    static const int vision_start = QWEN3_VISION_START_ID, vision_end = QWEN3_VISION_END_ID;
+    static const int image_pad = QWEN3_IMAGE_PAD_ID;
+    if (!prompt[0]) prompt = " ";
+
+    char *sys_text = malloc(strlen(system) + 8);
+    sprintf(sys_text, "system\n%s", system);
+    int n_sys, n_prompt, n_nl, n_asst;
+    int *sys_ids = qwen3_tokenize(tok, sys_text, &n_sys, INT_MAX);
+    int *prompt_ids = qwen3_tokenize(tok, prompt, &n_prompt, INT_MAX);
+    int *nl_ids = qwen3_tokenize(tok, "\n", &n_nl, INT_MAX);
+    int *asst_ids = qwen3_tokenize(tok, "assistant\n", &n_asst, INT_MAX);
+    free(sys_text);
+
+    int capacity = 256, total = 0;
+    int *tokens = malloc(capacity * sizeof(int));
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, sys_ids, n_sys);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    *num_system = total;
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    for (int i = 0; i < n; i++) {
+        char label[32];
+        int n_label;
+        snprintf(label, sizeof(label), "%s<image%d>", i ? " " : "user\n", i + 1);
+        int *label_ids = qwen3_tokenize(tok, label, &n_label, INT_MAX);
+        tokens = append_tokens(tokens, &total, &capacity, label_ids, n_label);
+        free(label_ids);
+        tokens = append_tokens(tokens, &total, &capacity, &vision_start, 1);
+        image_rows[i] = total;
+        for (int s = 0; s < slots[i]; s++)
+            tokens = append_tokens(tokens, &total, &capacity, &image_pad, 1);
+        tokens = append_tokens(tokens, &total, &capacity, &vision_end, 1);
+    }
+    tokens = append_tokens(tokens, &total, &capacity, prompt_ids, n_prompt);
+    tokens = append_tokens(tokens, &total, &capacity, &im_end, 1);
+    tokens = append_tokens(tokens, &total, &capacity, nl_ids, n_nl);
+    tokens = append_tokens(tokens, &total, &capacity, &im_start, 1);
+    tokens = append_tokens(tokens, &total, &capacity, asst_ids, n_asst);
+
+    free(sys_ids);
+    free(prompt_ids);
+    free(nl_ids);
+    free(asst_ids);
     *num_tokens = total;
     return tokens;
 }

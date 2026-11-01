@@ -230,9 +230,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -W, --width N         Output width (default: %d)\n", DEFAULT_WIDTH);
     fprintf(stderr, "  -H, --height N        Output height (default: %d)\n", DEFAULT_HEIGHT);
     fprintf(stderr, "  -s, --steps N         Sampling steps (default: auto, 4 distilled / 50 base / 9 zimage /\n");
-    fprintf(stderr, "                        16 flux3 distilled / 50 flux3 base)\n");
+    fprintf(stderr, "                        16 flux3 distilled / 50 flux3 base / 40 qwen-image /\n");
+    fprintf(stderr, "                        qwen-image turbo: fixed 8-step grid)\n");
     fprintf(stderr, "  -g, --guidance N      CFG guidance scale (default: auto, 1.0 distilled / 4.0 base / 0.0 zimage /\n");
-    fprintf(stderr, "                        0.0 flux3 distilled / 3.5 flux3 base)\n");
+    fprintf(stderr, "                        0.0 flux3 distilled / 3.5 flux3 base / 0.0 qwen-image)\n");
     fprintf(stderr, "  -S, --seed N          Random seed (-1 for random)\n");
     fprintf(stderr, "      --linear          Use linear timestep schedule\n");
     fprintf(stderr, "      --power           Use power curve timestep schedule (default alpha: 2.0)\n");
@@ -584,7 +585,8 @@ int main(int argc, char *argv[]) {
                         i + 1, inputs[i]->width, inputs[i]->height, inputs[i]->channels);
         }
 
-        /* Without an explicit size the library uses the first reference's */
+        /* Without an explicit size the library sizes the output from the
+         * references (the first one's, the last one's for Qwen-Image) */
         if (!width_set || !height_set) params.width = params.height = 0;
 
         /* Generate with multi-reference */

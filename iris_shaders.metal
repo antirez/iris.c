@@ -615,6 +615,10 @@ kernel void attention_fused(
  * (e.g., 32 Q heads / 8 KV heads = 4 Q heads per KV)
  * ======================================================================== */
 
+/* The longest sequence the attention kernels below hold, Qwen3-VL's. iris_metal.m
+ * has the same limit: 5.1 KB of the 32 KB of threadgroup memory Metal allows. */
+#define CAUSAL_ATTENTION_MAX_SEQ 1280
+
 /* Fused causal attention - one threadgroup per (query_pos, head) pair
  * Q: [seq, num_q_heads * head_dim]
  * K: [seq, num_kv_heads * head_dim]
@@ -639,7 +643,7 @@ kernel void causal_attention_fused(
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
     // Shared memory for scores and reductions
-    threadgroup float shared_scores[512];  // For attention scores (up to 512 seq len)
+    threadgroup float shared_scores[CAUSAL_ATTENTION_MAX_SEQ];  // For attention scores
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
 
@@ -1827,7 +1831,7 @@ kernel void causal_attention_fused_bf16(
     uint3 tg_size [[threads_per_threadgroup]]
 ) {
     // Shared memory for scores and reductions
-    threadgroup float shared_scores[512];
+    threadgroup float shared_scores[CAUSAL_ATTENTION_MAX_SEQ];
     threadgroup float shared_max[256];
     threadgroup float shared_sum[256];
     threadgroup float shared_q[128];  // Cache Q for this query position

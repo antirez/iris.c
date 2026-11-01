@@ -57,7 +57,6 @@ typedef cudaDeviceProp dev_prop_t;
 
 #define ROW_THREADS 256     /* Threads for one-row-per-block kernels */
 #define EW_THREADS 256      /* Threads for elementwise kernels */
-#define ATTN_SCRATCH ((size_t)1 << 30)  /* Score buffer budget (bytes) */
 #define CONV_SCRATCH ((size_t)256 << 20) /* im2col buffer budget (bytes) */
 #define GN_BLOCKS 64                     /* Blocks per group for GroupNorm stats */
 #define STAGE_BYTES ((size_t)64 << 20)   /* Pinned upload staging buffer (CUDA, each of 2) */
@@ -172,6 +171,19 @@ extern "C" void iris_dev_cleanup(void) {
     g_ready = 0;
 }
 
+extern "C" size_t iris_dev_memory(int held) {
+    size_t avail = 0, total = 0;
+    GPU(MemGetInfo)(&avail, &total);
+    if (!held) return avail;
+    /* The scratch buffers grow in place: a new run reuses them. */
+    avail += g_attn_scratch_size + g_gn_scratch_size * sizeof(float);
+    if (g_conv_scratch) avail += CONV_SCRATCH;
+#ifdef IRIS_HIP
+    avail += g_gemm_scratch_elems * sizeof(uint16_t);
+#endif
+    return avail;
+}
+
 extern "C" void *iris_dev_alloc(size_t bytes) {
     void *p = NULL;
     if (GPU(Malloc)(&p, bytes ? bytes : 1) != GPU(Success)) return NULL;
@@ -223,6 +235,13 @@ extern "C" void iris_dev_upload(void *dst, const void *src, size_t bytes) {
 extern "C" void iris_dev_download(void *dst, const void *src, size_t bytes) {
     check(GPU(MemcpyAsync)(dst, src, bytes, GPU(MemcpyDeviceToHost), g_stream), "download");
     check(GPU(StreamSynchronize)(g_stream), "sync");
+}
+
+extern "C" void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds,
+                                 int rows, int cols) {
+    if (rows && cols)
+        check(GPU(Memcpy2DAsync)(dst, (size_t)ldd * 2, src, (size_t)lds * 2, (size_t)cols * 2,
+                                 rows, GPU(MemcpyDeviceToDevice), g_stream), "copy");
 }
 
 extern "C" void iris_dev_sync(void) {
@@ -287,6 +306,13 @@ __global__ void k_silu(float *x, size_t n) {
     if (i < n) x[i] = x[i] / (1.0f + expf(-x[i]));
 }
 
+__global__ void k_gelu_tanh(float *x, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float u = x[i];
+    x[i] = 0.5f * u * (1.0f + tanhf(0.7978845608028654f * (u + 0.044715f * u * u * u)));
+}
+
 __global__ void k_add(float *x, const float *a, size_t n) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += a[i];
@@ -319,6 +345,10 @@ extern "C" void iris_dev_f32_to_bf16(uint16_t *dst, const float *src, size_t n) 
 
 extern "C" void iris_dev_silu(float *x, size_t n) {
     if (n) k_silu<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, n);
+}
+
+extern "C" void iris_dev_gelu_tanh(float *x, size_t n) {
+    if (n) k_gelu_tanh<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, n);
 }
 
 extern "C" void iris_dev_add(float *x, const float *a, size_t n) {
@@ -419,6 +449,21 @@ __global__ void k_head_norm_rope(uint16_t *x, int ld, const float *w,
     v[i1] = f2bf(b * c + a * sn);
 }
 
+/* One thread per rotated pair of the (row, head) grid. */
+__global__ void k_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin,
+                       int heads, int head_dim, size_t n) {
+    size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    int half = head_dim / 2;
+    size_t s = e / (heads * half);
+    int rest = (int)(e % (heads * half)), i = rest % half;
+    uint16_t *v = x + s * ld + (size_t)(rest / half) * head_dim;
+    float a = bf2f(v[i]), b = bf2f(v[i + half]);
+    float c = rope_cos[s * half + i], sn = rope_sin[s * half + i];
+    v[i] = f2bf(a * c - b * sn);
+    v[i + half] = f2bf(b * c + a * sn);
+}
+
 extern "C" void iris_dev_layer_norm_mod(uint16_t *out, const float *x,
                                         const float *shift, const float *scale,
                                         int rows, int dim, float eps) {
@@ -450,6 +495,13 @@ extern "C" void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
     int threads = head_dim / 2;   /* power of two for block_reduce */
     k_head_norm_rope<<<dim3(seq, heads), threads, threads * sizeof(float), g_stream>>>(
         x, ld, w, rope_cos, rope_sin, head_dim, eps, split_half);
+}
+
+extern "C" void iris_dev_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin,
+                              int seq, int heads, int head_dim) {
+    size_t n = (size_t)seq * heads * (head_dim / 2);
+    if (n) k_rope<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(x, ld, rope_cos, rope_sin, heads,
+                                                             head_dim, n);
 }
 
 /* ========================================================================
@@ -518,7 +570,7 @@ __global__ void k_softmax(uint16_t *P, const float *S, int nq, int seq_k, int q0
     int qi = q0 + (int)(row % nq);
     const float *s = S + row * seq_k;
     uint16_t *p = P + row * seq_k;
-    int limit = causal ? (qi + 1 < seq_k ? qi + 1 : seq_k) : seq_k;
+    int limit = causal ? (qi + causal < seq_k ? qi + causal : seq_k) : seq_k;
 
     float m = -INFINITY;
     for (int j = threadIdx.x; j < limit; j += blockDim.x)
@@ -1089,4 +1141,67 @@ __global__ void k_upsample2x(float *out, const float *in, int h, int w, int c, s
 extern "C" void iris_dev_upsample2x(float *out, const float *in, int h, int width, int c) {
     size_t n = (size_t)4 * h * width * c;
     if (n) k_upsample2x<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, h, width, c, n);
+}
+
+__global__ void k_pixel_rms_norm(float *out, const float *in, const float *gamma, int c,
+                                 int silu, int hw) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= hw) return;
+    const float *x = in + (size_t)p * c;
+    float *o = out + (size_t)p * c;
+    float s = 0;
+    for (int i = 0; i < c; i++) s += x[i] * x[i];
+    float norm = sqrtf(s);
+    float inv = sqrtf((float)c) / (norm > 1e-12f ? norm : 1e-12f);
+    for (int i = 0; i < c; i++) {
+        float v = x[i] * inv * gamma[i];
+        o[i] = silu ? v / (1.0f + expf(-v)) : v;
+    }
+}
+
+extern "C" void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma,
+                                        int hw, int c, int silu) {
+    if (hw) k_pixel_rms_norm<<<ew_blocks(hw), EW_THREADS, 0, g_stream>>>(out, in, gamma, c,
+                                                                         silu, hw);
+}
+
+__global__ void k_dup_up_add(float *out, const float *in, int w, int cin, int cout, int ft,
+                             int repeats, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int o = (int)(i % cout);
+    size_t p = i / cout;
+    int x2 = (int)(p % (2 * w)), y2 = (int)(p / (2 * w));
+    int src = (((o * ft + ft - 1) * 2 + (y2 & 1)) * 2 + (x2 & 1)) / repeats;
+    out[i] += in[((size_t)(y2 / 2) * w + x2 / 2) * cin + src];
+}
+
+extern "C" void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin,
+                                    int cout, int ft) {
+    size_t n = (size_t)4 * h * width * cout;
+    if (n) k_dup_up_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, width, cin, cout, ft,
+                                                                   cout * ft * 4 / cin, n);
+}
+
+__global__ void k_avg_down_add(float *out, const float *in, int w, int cin, int cout, int ft,
+                               int group, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int o = (int)(i % cout);
+    size_t p = i / cout;
+    int x = (int)(p % (w / 2)), y = (int)(p / (w / 2));
+    float s = 0;
+    for (int g = 0; g < group; g++) {
+        int idx = o * group + g, rest = idx >> 2;
+        if (rest % ft == ft - 1)
+            s += in[((size_t)(2 * y + ((idx >> 1) & 1)) * w + 2 * x + (idx & 1)) * cin + rest / ft];
+    }
+    out[i] += s / group;
+}
+
+extern "C" void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin,
+                                      int cout, int ft) {
+    size_t n = (size_t)(h / 2) * (width / 2) * cout;
+    if (n) k_avg_down_add<<<ew_blocks(n), EW_THREADS, 0, g_stream>>>(out, in, width, cin, cout, ft,
+                                                                     cin * ft * 4 / cout, n);
 }

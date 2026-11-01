@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 /* Maximum number of tensors per file */
-#define SAFETENSORS_MAX_TENSORS 512
+#define SAFETENSORS_MAX_TENSORS 1024  /* Qwen3-VL in one file: 750 */
 
 /* Tensor data types */
 typedef enum {

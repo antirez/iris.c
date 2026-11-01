@@ -23,6 +23,8 @@ MODELS = {
     "zimage-turbo": ("Tongyi-MAI/Z-Image-Turbo", "./zimage-turbo"),
     "flux3": ("black-forest-labs/flux-3-image-klein", "./flux-3-klein"),
     "flux3-base": ("black-forest-labs/flux-3-image-klein-base", "./flux-3-klein-base"),
+    "qimage": ("Qwen/Qwen-Image-2.1", "./qwen-image-2.1"),
+    "qimage-turbo": ("Qwen/Qwen-Image-2.1-Turbo", "./qwen-image-2.1-turbo"),
 }
 
 USAGE_TEXT = """\
@@ -39,6 +41,8 @@ Available models:
   zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)
   flux3         FLUX.3 Image Klein 5.6B (16 steps, Kommunity license, ~21 GB disk)
   flux3-base    FLUX.3 Image Klein Base 5.6B (50 steps, CFG, Kommunity license, ~21 GB disk)
+  qimage        Qwen-Image 2.1 (40 steps, Qwen Research license: non-commercial, ~32 GB disk)
+  qimage-turbo  Qwen-Image 2.1 Turbo (8 steps, Qwen Research license: non-commercial, ~32 GB disk)
 
 By default this implementation uses mmap() so inference is often
 possible with less RAM than the model size.
@@ -98,6 +102,7 @@ def main():
     print()
 
     # Files to download - VAE, transformer, Qwen3 text encoder, and model_index.json
+    # (Qwen-Image also needs its scheduler config and keeps the tokenizer in processor/)
     patterns = [
         "model_index.json",
         "modular_model_index.json",
@@ -107,6 +112,8 @@ def main():
         "transformer/*.json",
         "text_encoder/*",
         "tokenizer/*",
+        "scheduler/*.json",
+        "processor/*",
     ]
 
     print("Downloading files...")

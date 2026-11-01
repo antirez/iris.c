@@ -154,6 +154,9 @@ void iris_silu(float *x, int n);
 /* Fused SiLU(gate) * up - single pass for SwiGLU */
 void iris_silu_mul(float *gate, const float *up, int n);
 
+/* GELU, tanh approximation */
+void iris_gelu_tanh(float *x, size_t n);
+
 /* Softmax over last dimension */
 void iris_softmax(float *x, int rows, int cols);
 void iris_softmax_cpu(float *x, int rows, int cols);

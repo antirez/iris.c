@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define ATTN_SCRATCH ((size_t)1 << 30)  /* CUDA/ROCm score buffer budget (bytes) */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +33,10 @@ const char *iris_dev_name(void);
 void iris_dev_cleanup(void);   /* Release the stream and BLAS handle */
 
 /* Memory */
+/* Bytes that can be allocated now; with held, for a run that takes the place
+ * of what this process holds (Metal: its graphs; CUDA: its scratch buffers).
+ * They stay and are reused. */
+size_t iris_dev_memory(int held);
 void *iris_dev_alloc(size_t bytes);       /* NULL on failure */
 void iris_dev_free(void *p);
 /* Both wait for the copy: the host buffer can be reused on return. */
@@ -41,6 +47,10 @@ void iris_dev_download(void *dst, const void *src, size_t bytes);
 void iris_dev_upload_2d(void *dst, size_t dst_stride, const void *src, size_t src_stride,
                         size_t row_bytes, size_t rows);
 void iris_dev_sync(void);
+
+/* Device-to-device copy of a bf16 matrix, in stream order (no sync):
+ * dst[r, c] = src[r, c] for r < rows, c < cols, row strides ldd / lds. */
+void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int rows, int cols);
 
 /* dst[i] = bf16(src[i]) */
 void iris_dev_f32_to_bf16(uint16_t *dst, const float *src, size_t n);
@@ -80,11 +90,17 @@ void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w,
                              int seq, int heads, int head_dim, float eps,
                              int split_half);
 
+/* In place, no norm: rotate the pairs (i, i + head_dim / 2) of the heads
+ * x[s, h * head_dim + d] (row stride ld) by the angles of row s
+ * (cos/sin: [seq, head_dim / 2]). */
+void iris_dev_rope(uint16_t *x, int ld, const float *cos, const float *sin,
+                   int seq, int heads, int head_dim);
+
 /* Scaled dot-product attention over bf16 [seq, heads * head_dim] tensors.
  * q, k, v share the row stride ldi, out has row stride ldo. With fewer kv
  * heads (GQA), query head h uses kv head h / (heads / kv_heads).
- * causal: query i ignores keys j > i. key_mask: device int [seq_k],
- * 0 = ignored key, or NULL. */
+ * causal: 0 = all keys, n > 0 = query i sees keys j < i + n. key_mask:
+ * device int [seq_k], 0 = ignored key, or NULL. */
 void iris_dev_attention(uint16_t *out, int ldo,
                         const uint16_t *q, const uint16_t *k, const uint16_t *v,
                         int ldi, int seq_q, int seq_k, int heads, int kv_heads,
@@ -102,6 +118,7 @@ void iris_dev_residual(float *x, const float *a, const float *gate,
 
 /* Elementwise helpers on f32 vectors. */
 void iris_dev_silu(float *x, size_t n);
+void iris_dev_gelu_tanh(float *x, size_t n);
 void iris_dev_add(float *x, const float *a, size_t n);   /* x += a */
 void iris_dev_add_bias(float *y, const float *bias, int rows, int cols);  /* y[r, c] += bias[c] */
 void iris_dev_fill_rows(float *out, const float *row, int rows, int dim); /* out[r, c] = row[c] */
@@ -125,6 +142,24 @@ void iris_dev_group_norm(float *out, const float *in, const float *gamma, const 
 
 /* Nearest-neighbor 2x upsampling of [h * w, c] into [2h * 2w, c]. */
 void iris_dev_upsample2x(float *out, const float *in, int h, int width, int c);
+
+/* out = in / max(||in||, 1e-12) * sqrt(c) * gamma over the channels of each
+ * of the hw pixels, optionally followed by SiLU. out may be in. */
+void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma,
+                             int hw, int c, int silu);
+
+/* Channel-to-space shortcut, added to out [2h * 2w, cout]:
+ *   out[(2y + i, 2x + j), o] += in[(y, x), (((o * ft + ft - 1) * 2 + i) * 2 + j) / repeats]
+ * with repeats = cout * ft * 4 / cin. */
+void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin, int cout,
+                         int ft);
+
+/* Space-to-channel shortcut of in [h * w, cin], added to out [h/2 * w/2, cout]:
+ *   out[(y, x), o] += sum_{g < G} X[o * G + g] / G, with G = cin * ft * 4 / cout
+ * and X[((c * ft + t) * 2 + i) * 2 + j] = in[(2y + i, 2x + j), c] for
+ * t = ft - 1, 0 for other t. */
+void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin, int cout,
+                           int ft);
 
 #ifdef __cplusplus
 }

@@ -146,6 +146,11 @@ int iris_is_zimage(iris_ctx *ctx);
 int iris_is_flux3(iris_ctx *ctx);
 
 /*
+ * Check if model is Qwen-Image 2.1 (base or Turbo).
+ */
+int iris_is_qimage(iris_ctx *ctx);
+
+/*
  * Default number of steps and guidance scale for the loaded model.
  */
 int iris_default_steps(iris_ctx *ctx);
@@ -176,6 +181,10 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
 
 /*
  * Multi-reference generation (up to 4 reference images for klein).
+ * Qwen-Image: both calls size every reference to about 1024x1024 and, with
+ * width or height 0, the target from the last reference. The references and
+ * the prompt can take 17280 text encoder tokens (a reference about 1024); a
+ * run over that, or that does not fit in memory, fails before it starts.
  */
 iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
                           const iris_image **refs, int num_refs,
