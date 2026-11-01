@@ -16,13 +16,18 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include "iris_dev.h"
+#include <mach/mach.h>
 #include <stdio.h>
 #include <string.h>
 
 #define EW_THREADS 256
 #define ROW_THREADS 256
 #define CONV_SCRATCH ((size_t)256 << 20)   /* im2col buffer budget (bytes) */
+#define ATTN_MAX_SCORES ((size_t)1 << 31)  /* Scores of one SDPA graph */
 #define GN_BLOCKS 64
+/* A command buffer holds 32 residency sets and a graph takes about two of
+ * them (measured: 24 graphs overflow, 16 fit). */
+#define CMD_MAX_GRAPHS 12
 
 static int g_ready = 0;
 static char g_name[256] = "none";
@@ -32,6 +37,7 @@ static id<MTLCommandBuffer> g_cmd;              /* open command buffer, or nil *
 static NSMutableArray<id<MTLBuffer>> *g_buffers; /* sorted by contents address */
 static id<MTLBuffer> g_dummy;                   /* bound for NULL arguments */
 static NSMutableDictionary *g_graphs;           /* MPSGraph cache by shape key */
+static NSMutableSet *g_cmd_graphs;              /* graphs in the open command buffer */
 
 /* Scratch for attention (contiguous q, k, v, out), convolution, GroupNorm. */
 static uint16_t *g_attn_scratch = NULL;
@@ -40,10 +46,11 @@ static uint16_t *g_conv_scratch = NULL;
 static float *g_gn_scratch = NULL;
 static size_t g_gn_scratch_size = 0;
 
-static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_add, p_add_bias, p_swiglu,
+static id<MTLComputePipelineState> p_f32_to_bf16, p_silu, p_gelu_tanh, p_add, p_add_bias, p_swiglu,
     p_residual, p_fill_rows, p_layer_norm_mod, p_rms_norm, p_rms_norm_residual, p_key_mask_bias,
-    p_head_norm_rope, p_copy_2d, p_im2col,
-    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x;
+    p_head_norm_rope, p_rope, p_copy_2d, p_im2col,
+    p_gn_partial, p_gn_finalize, p_gn_apply, p_upsample2x, p_pixel_rms_norm, p_dup_up_add,
+    p_avg_down_add;
 
 /* ========================================================================
  * Kernels
@@ -80,6 +87,12 @@ kernel void f32_to_bf16(device ushort *dst, device const float *src, constant ul
 
 kernel void silu(device float *x, constant ulong &n, uint i [[thread_position_in_grid]]) {
     if (i < n) x[i] = x[i] / (1.0f + exp(-x[i]));
+}
+
+kernel void gelu_tanh(device float *x, constant ulong &n, uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    float u = x[i];
+    x[i] = 0.5f * u * (1.0f + precise::tanh(0.7978845608028654f * (u + 0.044715f * u * u * u)));
 }
 
 kernel void add(device float *x, device const float *a, constant ulong &n,
@@ -196,6 +209,20 @@ kernel void head_norm_rope(device ushort *x, device const float *w, device const
     v[i1] = f2bf(b * c + a * s);
 }
 
+kernel void rope(device ushort *x, device const float *rc, device const float *rs,
+                 constant int &ld, constant int &heads, constant int &head_dim,
+                 constant ulong &n, uint e [[thread_position_in_grid]]) {
+    if (e >= n) return;
+    int half_dim = head_dim / 2;
+    ulong s = e / (ulong)(heads * half_dim);
+    int rest = int(e % (ulong)(heads * half_dim)), i = rest % half_dim;
+    device ushort *v = x + s * ld + (ulong)(rest / half_dim) * head_dim;
+    float a = bf2f(v[i]), b = bf2f(v[i + half_dim]);
+    float c = rc[s * half_dim + i], sn = rs[s * half_dim + i];
+    v[i] = f2bf(a * c - b * sn);
+    v[i + half_dim] = f2bf(b * c + a * sn);
+}
+
 /* dst[r * ldd + c] = src[r * lds + c] (bf16) */
 kernel void copy_2d(device ushort *dst, device const ushort *src, constant int &ldd,
                     constant int &lds, constant int &cols, constant ulong &n,
@@ -269,6 +296,50 @@ kernel void upsample2x(device float *out, device const float *in, constant int &
     int x = int(p % (2 * w)), y = int(p / (2 * w));
     out[i] = in[((ulong)(y / 2) * w + x / 2) * c + ch];
 }
+
+kernel void pixel_rms_norm(device float *out, device const float *in, device const float *gamma,
+                           constant int &c, constant int &silu_act, constant int &hw,
+                           uint p [[thread_position_in_grid]]) {
+    if (int(p) >= hw) return;
+    device const float *x = in + (ulong)p * c;
+    device float *o = out + (ulong)p * c;
+    float s = 0;
+    for (int i = 0; i < c; i++) s += x[i] * x[i];
+    float inv = sqrt(float(c)) / max(sqrt(s), 1e-12f);
+    for (int i = 0; i < c; i++) {
+        float v = x[i] * inv * gamma[i];
+        o[i] = silu_act ? v / (1.0f + exp(-v)) : v;
+    }
+}
+
+kernel void dup_up_add(device float *out, device const float *in, constant int &w,
+                       constant int &cin, constant int &cout, constant int &ft,
+                       constant int &repeats, constant ulong &n,
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    int o = int(i % cout);
+    ulong p = i / cout;
+    int x2 = int(p % (2 * w)), y2 = int(p / (2 * w));
+    int src = (((o * ft + ft - 1) * 2 + (y2 & 1)) * 2 + (x2 & 1)) / repeats;
+    out[i] += in[((ulong)(y2 / 2) * w + x2 / 2) * cin + src];
+}
+
+kernel void avg_down_add(device float *out, device const float *in, constant int &w,
+                         constant int &cin, constant int &cout, constant int &ft,
+                         constant int &group, constant ulong &n,
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    int o = int(i % cout);
+    ulong p = i / cout;
+    int x = int(p % (w / 2)), y = int(p / (w / 2));
+    float s = 0;
+    for (int g = 0; g < group; g++) {
+        int idx = o * group + g, rest = idx >> 2;
+        if (rest % ft == ft - 1)
+            s += in[((ulong)(2 * y + ((idx >> 1) & 1)) * w + 2 * x + (idx & 1)) * cin + rest / ft];
+    }
+    out[i] += s / group;
+}
 )MSL";
 
 /* ========================================================================
@@ -298,6 +369,7 @@ int iris_dev_init(void) {
         }
         p_f32_to_bf16 = pipeline(lib, @"f32_to_bf16");
         p_silu = pipeline(lib, @"silu");
+        p_gelu_tanh = pipeline(lib, @"gelu_tanh");
         p_add = pipeline(lib, @"add");
         p_add_bias = pipeline(lib, @"add_bias");
         p_swiglu = pipeline(lib, @"swiglu");
@@ -308,19 +380,25 @@ int iris_dev_init(void) {
         p_rms_norm_residual = pipeline(lib, @"rms_norm_residual");
         p_key_mask_bias = pipeline(lib, @"key_mask_bias");
         p_head_norm_rope = pipeline(lib, @"head_norm_rope");
+        p_rope = pipeline(lib, @"rope");
         p_copy_2d = pipeline(lib, @"copy_2d");
         p_im2col = pipeline(lib, @"im2col");
         p_gn_partial = pipeline(lib, @"gn_partial");
         p_gn_finalize = pipeline(lib, @"gn_finalize");
         p_gn_apply = pipeline(lib, @"gn_apply");
         p_upsample2x = pipeline(lib, @"upsample2x");
-        if (!p_f32_to_bf16 || !p_silu || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
+        p_pixel_rms_norm = pipeline(lib, @"pixel_rms_norm");
+        p_dup_up_add = pipeline(lib, @"dup_up_add");
+        p_avg_down_add = pipeline(lib, @"avg_down_add");
+        if (!p_f32_to_bf16 || !p_silu || !p_gelu_tanh || !p_add || !p_add_bias || !p_swiglu || !p_residual ||
             !p_fill_rows || !p_layer_norm_mod || !p_rms_norm || !p_rms_norm_residual ||
-            !p_key_mask_bias || !p_head_norm_rope || !p_copy_2d || !p_im2col ||
-            !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x)
+            !p_key_mask_bias || !p_head_norm_rope || !p_rope || !p_copy_2d || !p_im2col ||
+            !p_gn_partial || !p_gn_finalize || !p_gn_apply || !p_upsample2x ||
+            !p_pixel_rms_norm || !p_dup_up_add || !p_avg_down_add)
             return 0;
         g_buffers = [NSMutableArray array];
         g_graphs = [NSMutableDictionary dictionary];
+        g_cmd_graphs = [NSMutableSet set];
         g_dummy = [g_device newBufferWithLength:16 options:MTLResourceStorageModeShared];
         snprintf(g_name, sizeof(g_name), "%s", g_device.name.UTF8String);
     }
@@ -333,6 +411,7 @@ const char *iris_dev_name(void) { return g_name; }
 
 /* Commit the open command buffer and wait for it. */
 static void flush(void) {
+    [g_cmd_graphs removeAllObjects];
     if (!g_cmd) return;
     [g_cmd commit];
     [g_cmd waitUntilCompleted];
@@ -362,6 +441,7 @@ void iris_dev_cleanup(void) {
     g_gn_scratch = NULL;
     g_attn_scratch_elems = g_gn_scratch_size = 0;
     g_graphs = nil;
+    g_cmd_graphs = nil;
     g_buffers = nil;
     g_ready = 0;
 }
@@ -387,6 +467,20 @@ static id<MTLBuffer> find_buffer(const void *p, NSUInteger *offset) {
     if (a >= start + b.length) return nil;
     *offset = a - start;
     return b;
+}
+
+/* The GPU's working set budget, capped by what the system can give without
+ * paging: free pages and those it can drop (the file cache holds the weights). */
+size_t iris_dev_memory(int held) {
+    size_t budget = g_device.recommendedMaxWorkingSetSize, used = g_device.currentAllocatedSize;
+    budget = held ? budget : used < budget ? budget - used : 0;
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) !=
+        KERN_SUCCESS) return budget;
+    size_t system = (size_t)(vm.free_count + vm.external_page_count + vm.purgeable_count) *
+                    vm_page_size + (held ? used : 0);
+    return system < budget ? system : budget;
 }
 
 void *iris_dev_alloc(size_t bytes) {
@@ -487,6 +581,16 @@ void iris_dev_silu(float *x, size_t n) {
     if (!n) return;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> e = begin(p_silu);
+        arg_ptr(e, x, 0);
+        arg_ulong(e, n, 1);
+        end_elementwise(e, n);
+    }
+}
+
+void iris_dev_gelu_tanh(float *x, size_t n) {
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_gelu_tanh);
         arg_ptr(e, x, 0);
         arg_ulong(e, n, 1);
         end_elementwise(e, n);
@@ -636,6 +740,23 @@ void iris_dev_head_norm_rope(uint16_t *x, int ld, const float *w, const float *r
     }
 }
 
+void iris_dev_rope(uint16_t *x, int ld, const float *rope_cos, const float *rope_sin, int seq,
+                   int heads, int head_dim) {
+    size_t n = (size_t)seq * heads * (head_dim / 2);
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_rope);
+        arg_ptr(e, x, 0);
+        arg_ptr(e, rope_cos, 1);
+        arg_ptr(e, rope_sin, 2);
+        arg_int(e, ld, 3);
+        arg_int(e, heads, 4);
+        arg_int(e, head_dim, 5);
+        arg_ulong(e, n, 6);
+        end_elementwise(e, n);
+    }
+}
+
 static void copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int rows, int cols) {
     size_t n = (size_t)rows * cols;
     id<MTLComputeCommandEncoder> e = begin(p_copy_2d);
@@ -646,6 +767,11 @@ static void copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int ro
     arg_int(e, cols, 4);
     arg_ulong(e, n, 5);
     end_elementwise(e, n);
+}
+
+void iris_dev_copy_2d(uint16_t *dst, int ldd, const uint16_t *src, int lds, int rows, int cols) {
+    if (!rows || !cols) return;
+    @autoreleasepool { copy_2d(dst, ldd, src, lds, rows, cols); }
 }
 
 /* ========================================================================
@@ -675,6 +801,10 @@ static MPSGraphTensorData *tensor_data(const void *p, NSArray<NSNumber *> *shape
 }
 
 static void run_graph(IrisDevGraph *g, NSArray *ptrs, void *out) {
+    if (![g_cmd_graphs containsObject:g]) {
+        if (g_cmd_graphs.count >= CMD_MAX_GRAPHS) flush();
+        [g_cmd_graphs addObject:g];
+    }
     NSMutableDictionary *feeds = [NSMutableDictionary dictionary];
     for (NSUInteger i = 0; i < g.inputs.count; i++)
         feeds[g.inputs[i]] = tensor_data([ptrs[i] pointerValue], g.shapes[i], MPSDataTypeBFloat16);
@@ -725,36 +855,68 @@ void iris_dev_linear_bf16(uint16_t *y, const uint16_t *x, const uint16_t *W, int
     linear(y, MPSDataTypeBFloat16, x, W, rows, in, out);
 }
 
-static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, float scale,
-                                int masked) {
-    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %a %d", seq_q, seq_k, heads,
-                                               head_dim, scale, masked];
+static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int kv_heads, int head_dim,
+                                float scale, int masked, int causal) {
+    NSString *key = [NSString stringWithFormat:@"sdpa %d %d %d %d %d %a %d %d", seq_q, seq_k,
+                                               heads, kv_heads, head_dim, scale, masked, causal];
     IrisDevGraph *g = g_graphs[key];
     if (g) return g;
     g = [IrisDevGraph new];
     g.graph = [MPSGraph new];
-    NSArray *qs = @[@1, @(seq_q), @(heads), @(head_dim)], *ks = @[@1, @(seq_k), @(heads), @(head_dim)];
+    NSArray *qs = @[@1, @(seq_q), @(heads), @(head_dim)];
+    NSArray *ks = @[@1, @(seq_k), @(kv_heads), @(head_dim)];
     MPSGraphTensor *q = [g.graph placeholderWithShape:qs dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *k = [g.graph placeholderWithShape:ks dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *v = [g.graph placeholderWithShape:ks dataType:MPSDataTypeBFloat16 name:nil];
     MPSGraphTensor *qt = [g.graph transposeTensor:q dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *kt = [g.graph transposeTensor:k dimension:1 withDimension:2 name:nil];
     MPSGraphTensor *vt = [g.graph transposeTensor:v dimension:1 withDimension:2 name:nil];
-    MPSGraphTensor *o;
+    if (kv_heads != heads) {
+        /* GQA: the query heads of a kv head broadcast against it. */
+        qt = [g.graph reshapeTensor:qt withShape:@[@(kv_heads), @(heads / kv_heads), @(seq_q),
+                                                   @(head_dim)] name:nil];
+        kt = [g.graph reshapeTensor:kt withShape:@[@(kv_heads), @1, @(seq_k), @(head_dim)] name:nil];
+        vt = [g.graph reshapeTensor:vt withShape:@[@(kv_heads), @1, @(seq_k), @(head_dim)] name:nil];
+    }
+    NSMutableArray *inputs = [NSMutableArray arrayWithObjects:q, k, v, nil];
+    NSMutableArray *shapes = [NSMutableArray arrayWithObjects:qs, ks, ks, nil];
+    MPSGraphTensor *mask = nil;
     if (masked) {
         NSArray *ms = @[@1, @1, @1, @(seq_k)];
-        MPSGraphTensor *m = [g.graph placeholderWithShape:ms dataType:MPSDataTypeBFloat16 name:nil];
+        mask = [g.graph placeholderWithShape:ms dataType:MPSDataTypeBFloat16 name:nil];
+        [inputs addObject:mask];
+        [shapes addObject:ms];
+    }
+    if (causal) {
+        /* Additive bias: -inf where query i meets key j >= i + causal. Computed in
+         * the graph: as a constant it would stay in memory with every graph. */
+        MPSGraphTensor *i = [g.graph coordinateAlongAxis:2 withShape:@[@1, @1, @(seq_q), @1] name:nil];
+        MPSGraphTensor *j = [g.graph coordinateAlongAxis:3 withShape:@[@1, @1, @1, @(seq_k)] name:nil];
+        MPSGraphTensor *n = [g.graph constantWithScalar:causal dataType:MPSDataTypeInt32];
+        MPSGraphTensor *end = [g.graph additionWithPrimaryTensor:i secondaryTensor:n name:nil];
+        static const uint16_t neg_inf = 0xFF80;
+        MPSGraphTensor *hide = [g.graph constantWithData:[NSData dataWithBytes:&neg_inf length:2]
+                                                   shape:@[@1] dataType:MPSDataTypeBFloat16];
+        MPSGraphTensor *t = [g.graph
+            selectWithPredicateTensor:[g.graph greaterThanOrEqualToWithPrimaryTensor:j
+                                                                     secondaryTensor:end name:nil]
+                  truePredicateTensor:hide
+                 falsePredicateTensor:[g.graph constantWithScalar:0 dataType:MPSDataTypeBFloat16]
+                                 name:nil];
+        mask = mask ? [g.graph additionWithPrimaryTensor:mask secondaryTensor:t name:nil] : t;
+    }
+    MPSGraphTensor *o;
+    if (mask)
         o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
-                                                   maskTensor:m scale:scale name:nil];
-        g.inputs = @[q, k, v, m];
-        g.shapes = @[qs, ks, ks, ms];
-    } else {
+                                                   maskTensor:mask scale:scale name:nil];
+    else
         o = [g.graph scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt valueTensor:vt
                                                         scale:scale name:nil];
-        g.inputs = @[q, k, v];
-        g.shapes = @[qs, ks, ks];
-    }
+    if (kv_heads != heads)
+        o = [g.graph reshapeTensor:o withShape:@[@1, @(heads), @(seq_q), @(head_dim)] name:nil];
     o = [g.graph transposeTensor:o dimension:1 withDimension:2 name:nil];
+    g.inputs = inputs;
+    g.shapes = shapes;
     g.output = o;
     g.outShape = qs;
     g.outType = MPSDataTypeBFloat16;
@@ -763,20 +925,18 @@ static IrisDevGraph *sdpa_graph(int seq_q, int seq_k, int heads, int head_dim, f
 }
 
 /* Attention through MPSGraph's fused SDPA, on contiguous copies of q, k, v
- * when they are strided views; the key mask becomes an additive bias.
- * Supports the non-causal case with one kv head per query head. */
+ * when they are strided views; the key mask and the causal triangle become
+ * an additive bias. Queries run in chunks of at most ATTN_MAX_SCORES scores,
+ * so a long sequence does not need all its scores in memory at once. */
 void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_t *k,
                         const uint16_t *v, int ldi, int seq_q, int seq_k, int heads,
                         int kv_heads, int head_dim, float scale, int causal,
                         const int *key_mask) {
-    if (causal || kv_heads != heads) {
-        fprintf(stderr, "iris_dev: Metal attention supports only non-causal MHA\n");
-        return;
-    }
     @autoreleasepool {
-        int dim = heads * head_dim;
+        int dim = heads * head_dim, kv_dim = kv_heads * head_dim;
         int strided = ldi != dim, out_strided = ldo != dim;
-        size_t need = (size_t)(strided ? seq_q + 2 * seq_k : 0) * dim +
+        size_t need = (size_t)(strided ? seq_q : 0) * dim +
+                      (size_t)(strided ? 2 * seq_k : 0) * kv_dim +
                       (size_t)(out_strided ? seq_q : 0) * dim + (key_mask ? seq_k : 0);
         if (need > g_attn_scratch_elems) {
             iris_dev_free(g_attn_scratch);
@@ -787,29 +947,37 @@ void iris_dev_attention(uint16_t *out, int ldo, const uint16_t *q, const uint16_
         uint16_t *s = g_attn_scratch;
         const uint16_t *qc = q, *kc = k, *vc = v;
         if (strided) {
-            uint16_t *qs = s, *ks = qs + (size_t)seq_q * dim, *vs = ks + (size_t)seq_k * dim;
+            uint16_t *qs = s, *ks = qs + (size_t)seq_q * dim, *vs = ks + (size_t)seq_k * kv_dim;
             copy_2d(qs, dim, q, ldi, seq_q, dim);
-            copy_2d(ks, dim, k, ldi, seq_k, dim);
-            copy_2d(vs, dim, v, ldi, seq_k, dim);
+            copy_2d(ks, kv_dim, k, ldi, seq_k, kv_dim);
+            copy_2d(vs, kv_dim, v, ldi, seq_k, kv_dim);
             qc = qs;
             kc = ks;
             vc = vs;
-            s = vs + (size_t)seq_k * dim;
+            s = vs + (size_t)seq_k * kv_dim;
         }
         uint16_t *oc = out_strided ? s : out;
         if (out_strided) s += (size_t)seq_q * dim;
-        NSMutableArray *ptrs = [NSMutableArray arrayWithObjects:[NSValue valueWithPointer:qc],
-                                [NSValue valueWithPointer:kc], [NSValue valueWithPointer:vc], nil];
         if (key_mask) {
             id<MTLComputeCommandEncoder> e = begin(p_key_mask_bias);
             arg_ptr(e, s, 0);
             arg_ptr(e, key_mask, 1);
             arg_ulong(e, seq_k, 2);
             end_elementwise(e, seq_k);
-            [ptrs addObject:[NSValue valueWithPointer:s]];
         }
-        IrisDevGraph *g = sdpa_graph(seq_q, seq_k, heads, head_dim, scale, key_mask != NULL);
-        run_graph(g, ptrs, oc);
+        int chunk = (int)(ATTN_MAX_SCORES / ((size_t)heads * seq_k));
+        if (chunk < 1) chunk = 1;
+        for (int q0 = 0; q0 < seq_q; q0 += chunk) {
+            int nq = seq_q - q0 < chunk ? seq_q - q0 : chunk;
+            int keys = causal && q0 + nq - 1 + causal < seq_k ? q0 + nq - 1 + causal : seq_k;
+            NSMutableArray *ptrs = [NSMutableArray arrayWithObjects:
+                                    [NSValue valueWithPointer:qc + (size_t)q0 * dim],
+                                    [NSValue valueWithPointer:kc], [NSValue valueWithPointer:vc], nil];
+            if (key_mask) [ptrs addObject:[NSValue valueWithPointer:s]];
+            IrisDevGraph *g = sdpa_graph(nq, keys, heads, kv_heads, head_dim, scale,
+                                         key_mask != NULL, causal ? causal + q0 : 0);
+            run_graph(g, ptrs, oc + (size_t)q0 * dim);
+        }
         if (out_strided) copy_2d(out, ldo, oc, dim, seq_q, dim);
     }
 }
@@ -911,6 +1079,57 @@ void iris_dev_upsample2x(float *out, const float *in, int h, int width, int c) {
         arg_int(e, width, 2);
         arg_int(e, c, 3);
         arg_ulong(e, n, 4);
+        end_elementwise(e, n);
+    }
+}
+
+void iris_dev_pixel_rms_norm(float *out, const float *in, const float *gamma, int hw, int c,
+                             int silu) {
+    if (!hw) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_pixel_rms_norm);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_ptr(e, gamma, 2);
+        arg_int(e, c, 3);
+        arg_int(e, silu, 4);
+        arg_int(e, hw, 5);
+        end_elementwise(e, hw);
+    }
+}
+
+void iris_dev_dup_up_add(float *out, const float *in, int h, int width, int cin, int cout,
+                         int ft) {
+    size_t n = (size_t)4 * h * width * cout;
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_dup_up_add);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_int(e, width, 2);
+        arg_int(e, cin, 3);
+        arg_int(e, cout, 4);
+        arg_int(e, ft, 5);
+        arg_int(e, cout * ft * 4 / cin, 6);
+        arg_ulong(e, n, 7);
+        end_elementwise(e, n);
+    }
+}
+
+void iris_dev_avg_down_add(float *out, const float *in, int h, int width, int cin, int cout,
+                           int ft) {
+    size_t n = (size_t)(h / 2) * (width / 2) * cout;
+    if (!n) return;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> e = begin(p_avg_down_add);
+        arg_ptr(e, out, 0);
+        arg_ptr(e, in, 1);
+        arg_int(e, width, 2);
+        arg_int(e, cin, 3);
+        arg_int(e, cout, 4);
+        arg_int(e, ft, 5);
+        arg_int(e, cin * ft * 4 / cout, 6);
+        arg_ulong(e, n, 7);
         end_elementwise(e, n);
     }
 }

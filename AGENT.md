@@ -1,11 +1,13 @@
-This is a C implementation of three image synthesis model families:
+This is a C implementation of four image synthesis model families:
 - Flux.2 Klein (4B and 9B variants)
 - Z-Image-Turbo (6B)
 - FLUX.3 Image Klein (5.6B)
+- Qwen-Image 2.1 (about 7B transformer, base and Turbo)
 
 The project is called "Iris" (from the Greek goddess of the rainbow).
 The Flux models are created by Black Forest Labs.
 Z-Image-Turbo is published as `Tongyi-MAI/Z-Image-Turbo`.
+Qwen-Image 2.1 is published as `Qwen/Qwen-Image-2.1` and `Qwen/Qwen-Image-2.1-Turbo`.
 
 Model type and architecture are autodetected from model metadata/config files.
 Do not rely on hardcoded dimensions when a config value is available.
@@ -16,6 +18,7 @@ Do not rely on hardcoded dimensions when a config value is available.
 - **`_flux`** postfix on internal functions/types specific to the Flux model family
 - **`_zimage`** postfix on internal functions/types specific to Z-Image
 - **`_flux3`** postfix on internal functions/types specific to FLUX.3
+- **`_qimage`** postfix on internal functions/types specific to Qwen-Image 2.1
 - **No postfix** on public API functions (they route internally by model type)
 - **Unchanged**: `qwen3_*`, `safetensors_*`, `zi_*` internal helpers (component-level namespaces)
 
@@ -34,6 +37,11 @@ FLUX.3 variants (FLUX Kommunity License):
 - **Image Klein** (`flux-3-klein`): step-distilled flow map, 16 steps default (trained for 4..16), no CFG.
 - **Image Klein Base** (`flux-3-klein-base`): 50 steps, CFG 3.5.
 
+Qwen-Image 2.1 variants (Qwen Research License, non-commercial):
+- **Turbo** (`qwen-image-2.1-turbo`): fixed 8-sigma grid from `model_index.json`
+  (`sample_sigmas`), no CFG. `--steps` cannot change it.
+- **Base** (`qwen-image-2.1`): 40 steps default, no CFG (upstream default too).
+
 # High-Level Capabilities
 
 - Flux supports both txt2img and img2img with text conditioning.
@@ -42,6 +50,11 @@ FLUX.3 variants (FLUX Kommunity License):
   are prepared like the official image processor: one reference is kept whole
   (downscaled so its 16-px canvas fits 4 MP, reflect-padded, output cropped back),
   several are downscaled under 1 MP and center-cropped. Side cap: IRIS_VAE_MAX_DIM.
+- Qwen-Image supports txt2img and reference images (`-i`, up to 16). A reference is
+  sized to about 1024x1024 and takes about 1024 text encoder tokens and 4096
+  prefix tokens. QWEN3_QIMAGE_MAX_SEQ_LEN (17280) limits the encoder sequence.
+  A run over it, or over the memory estimate, fails before any expensive stage
+  (see Qwen-Image Long Sequences). A text-only prompt over it is cut with a warning.
 - Text embeddings are generated via Qwen3.
 - VAE is used for latent/image conversion in both families.
 
@@ -52,9 +65,15 @@ iris.c                    - Main library (model load, generation routing)
 iris_transformer_flux.c   - Flux diffusion transformer (MMDiT)
 iris_transformer_zimage.c - Z-Image transformer (S3-DiT)
 iris_transformer_flux3.c  - FLUX.3 transformer (per-mode + joint blocks)
+iris_transformer_qimage.c - Qwen-Image 2.1 transformer (single-stream, text prefix KV)
+iris_vae_qimage.c         - Qwen-Image 2.1 VAE (Wan-derived, 2D)
+iris_qimage.h             - Qwen-Image internal API (scheduler, transformer, VAE)
 iris_sample.c             - Sampling/denoising loops (Euler ODE)
 iris_qwen3.c              - Qwen3 text encoder
-iris_qwen3_tokenizer.c    - BPE tokenizer
+iris_qwen3_vision.c       - Qwen3-VL vision tower (Qwen-Image references)
+iris_qwen3_tokenizer.c    - BPE tokenizer (added tokens, NFC, Qwen2 pre-tokenizer)
+qwen3_rope_test.c         - Text encoder positions against a hand-written layout
+iris_nfc_table.h          - Unicode tables for NFC, from debug/gen_nfc_table.py
 iris_vae.c                - VAE encoder/decoder
 iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
 iris_metal.m              - Metal GPU acceleration runtime
@@ -78,7 +97,8 @@ main.c                    - CLI entry point
 
 This project implements five targets:
 - MPS: Apple Silicon GPU path. The transformers use iris_dev.h
-  (iris_dev_metal.m); the text encoder and the VAE use iris_metal.m.
+  (iris_dev_metal.m), like Qwen-Image's text encoder and VAE; the other text
+  encoders and VAEs use iris_metal.m.
 - CUDA / ROCm: NVIDIA / AMD GPU path (iris_dev.h, implemented by iris_cuda.cu,
   one source for nvcc and hipcc). All the transformers, the Qwen3 text
   encoder and the VAE.
@@ -114,6 +134,11 @@ FLUX.3 example:
 
     ./iris -d flux-3-klein -p "a fish" -o /tmp/flux3.png
 
+Qwen-Image example:
+
+    ./iris -d qwen-image-2.1-turbo -p "a fish" -W 1024 -H 1024 -o /tmp/qimage.png
+    ./iris -d qwen-image-2.1-turbo -p "make it a watercolor" -i photo.png -o /tmp/qedit.png
+
 If model weights are missing, use the download script only after user approval.
 
 # Python Reference Implementations
@@ -135,6 +160,20 @@ FLUX.3 reference:
   VAE decode) on the official Flux3Transformer2DModel source, fetched from a
   pinned diffusers commit (FLUX.3 is not in a diffusers release yet). Dumps
   every intermediate tensor as raw float32; `--noise` starts from a C noise file.
+
+Qwen-Image reference:
+- `debug/qimage_reference.py`: the QwenImage21Pipeline text-to-image loop on
+  the official diffusers classes (encode_prompt, KV cache, scheduler, VAE) in
+  float32. Dumps tokens, embeddings, sigmas, RoPE, per-step v/x, per-block
+  states, latent and image. `--emb` skips the text encoder, `--decode` only
+  decodes a latent. C side: `./iris -d MODEL -e emb.bin --noise noise.bin`.
+- `debug/dump_noise.c`: writes the noise iris draws for a seed, for `--noise`.
+- `debug/dump_emb.c`: writes the text embeddings iris computes for a prompt.
+- With `--image` the reference also dumps the reference images, VAE stages,
+  vision tower and text layers. `debug/dump_qimage_refs.c` compares the
+  transformer on them, `debug/dump_qimage_text.c` the text encoder (tokens and
+  positions exactly), `debug/dump_qimage_e2e.c` the whole pipeline from real
+  images with the dumped noise, at any `--ref-resolution`.
 
 Rules:
 - Never add/commit `flux_env/` or `flux2/`.
@@ -439,6 +478,8 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
    The pre-tokenizer must follow the Qwen2 split regex exactly (all models):
    a simplified split gave different tokens for hyphenated words, quotes,
    punctuation before newlines, repeated spaces, and changed the images.
+   Before it, added tokens split the text (even inside a prompt) and the pieces
+   go through the tokenizer's NFC normalizer.
 2. **GPU attention threadgroup size**: the causal attention kernels use tree
    reductions that need a power-of-two thread count. Flux/Z-Image always used
    512 tokens; Flux3 windows (80, 160, ...) exposed the bug.
@@ -446,6 +487,175 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
    prompt, so they must not go through the pointer-keyed rope buffer cache.
 4. **Metal weight cache keys**: on MPS builds, Flux3 linears pass the mmapped
    bf16 weight pointers; a reused f32 conversion scratch would be served stale.
+
+# Qwen-Image 2.1 Architecture
+
+Transformer config (reference): dim=4096, heads=32, head_dim=128, 32 blocks,
+mlp_ratio=3, in/out channels 64, patch_size 1, axes_dims_rope=[16,56,56],
+theta 10000 (hardcoded upstream), eps 1e-6, causal_condition=true. No biases.
+
+- Sequence `[TEXT | IMAGE]`; image tokens are latent pixels in raster order.
+- Block (sequential): `x += tanh(g1) * attn(LN(x) * (1 + s1))`, then
+  `x += tanh(g2) * mlp(LN(x) * (1 + s2))`; no shift. MLP is
+  `out(silu(gate_layer(n)) * proj(n))`.
+- One modulation projection for all blocks: `[s1, g1, s2, g2]`. Text uses
+  t = 0, image tokens t. Output layer: `LN(x) * (1 + scale)` (scale only).
+- Attention: text causal, image tokens see all text and image tokens.
+- Text input: RMSNorm with weight + 1 (zero-centered), linear, GELU-tanh, linear.
+- RoPE consecutive pairs; text token i at (i, i, i); image (T, r - (H - H/2),
+  c - (W - W/2)), T the text length. Angles are float32 like the reference.
+- Text is independent of the image and the step, so iris prefills its K/V
+  once per prompt (the reference KV cache, filled before step 0) and each
+  step runs only image tokens against them.
+- Scheduler: FlowMatchEulerDiscreteScheduler settings read from
+  `scheduler/scheduler_config.json`, applied to Turbo's sample_sigmas too.
+- VAE: 2D convs, per-pixel RMS norms (F.normalize * sqrt(C) * gamma), residual
+  up blocks with a DupUp shortcut, mid single-head attention, RGBA out. Latent
+  denorm `z * std + mean` (64 values each from config). The encoder mirrors it
+  (down conv pads right and bottom by 1, AvgDown shortcut), is loaded at the
+  first encode and freed by iris_vae_release_qimage(); the latent is the
+  normalized posterior mean.
+- Reference preparation (iris_image.c): RGBA, 32-px grid with Python's round,
+  premultiplied Lanczos, vision copy over white. The resize is PIL's 8-bit one
+  (fixed-point weights, rounded and clipped after each pass), not
+  iris_image_resize, whose float passes FLUX.3 relies on: the encoder turns the
+  difference of up to 6/255 RMS into 1-7% of latent error.
+
+# Qwen-Image Text Encoder
+
+- Qwen3-VL-8B text model (`model.language_model.`), same shape as Qwen3-8B.
+- Raw template with a system message, no `<think>`; the system block tokens
+  are dropped. Embedding = last layer output BEFORE the final norm.
+- Only real tokens reach the transformer; the encoder pads to a multiple of
+  80 after them (causal, so harmless).
+- Work buffers follow the real sequence (qwen3_ensure_work). attn_scores holds
+  one head, seq^2 floats: the CPU path runs heads one at a time.
+- Tokenizer may live in `processor/`; Turbo's encoder may be one
+  `model.safetensors`.
+
+With references (qwen3_encode_images):
+- The user turn is `<image1><|vision_start|>pad * n<|vision_end|>`, then
+  ` <image2>...`, then the prompt. `<imageN>` is literal text, every piece
+  between special tokens is tokenized alone, n = (H/32) * (W/32).
+- The main vision embeddings replace the pad rows after the embedding lookup,
+  the deepstack features are added to them after layers 0, 1 and 2. Text
+  before the first image is unaffected.
+- MRoPE, all in qwen3_set_rope_positions: text (p, p, p); image
+  (p, p + row, p + col) in merged blocks, then p += max(h, w). With
+  mrope_section [24, 20, 20], frequencies i < 60 follow height when i%3 == 1,
+  width when i%3 == 2, the others the frame.
+- Slot rows are not returned: the transformer fills them with latents, and
+  iris_qimage_ref_t.pos counts the text rows before each block.
+- Reference pipeline (iris_generate_refs_qimage): prepare, VAE encode, vision
+  tower, text, each freed before the next. A transformer left by the previous
+  generation is freed first: beside all three the REPL peaks at 41 GB instead of
+  29 GB, and reloading it costs under 2 s. Text-only generations keep it. Without
+  -W -H the target follows the
+  LAST reference at 1024x1024 area (FLUX.3 follows the first), and -W -H never
+  change the reference size.
+
+# Qwen-Image Long Sequences
+
+- A reference takes about 1024 encoder tokens: two need 2100, ten 10300.
+- Metal encoder: with mapped weights Qwen-Image runs qwen3_forward_dev, the path
+  CUDA and ROCm use for everything (QWEN3_USE_DEV, keyed on the extraction mode).
+  The other models stay on the native iris_metal.m path, which ends at
+  CAUSAL_ATTENTION_MAX_SEQ (1280, threadgroup scores, Metal allows 32 KB) and
+  which FLUX.3's byte-exact hashes rest on. Qwen-Image falls back to it up to 1280
+  tokens when the device path cannot allocate or is not initialized; --no-mmap
+  and library callers without iris_set_mmap() also stay on it, with different
+  output. Time and memory are equal, and
+  the device path is closer: text rows 1.1% against 7.1% off float32 at 17 tokens,
+  1.3% against 6.7% at 1060, upstream bf16 7.0% and 6.8%. See pitfall 3 below for
+  why the final latent does not follow.
+- iris_dev_attention on Metal: GQA by broadcasting the query heads of a kv head
+  against it, and queries split in chunks of ATTN_MAX_SCORES scores, raising
+  causal (query i sees keys j < i + n). That is what runs a long causal segment
+  of the prefill too. The causal bias is computed in the graph, a constant
+  would stay with every cached graph. CUDA needs none of this: its GEMM path
+  already works in query chunks of ATTN_SCRATCH.
+- ATTN_MAX_SCORES (2^31) sits above every byte-exact case: at 2^29 the 1-MP
+  reference runs split, and MPSGraph rounds a split run differently.
+- iris_fit_qimage() refuses a run before the first stage: over the token limit
+  (without the device path on Metal, mapped weights: 1280), or when the largest
+  stage does not fit. Stages: iris_transformer_memory_qimage() (prefix,
+  activations, weights on a GPU, what MPSGraph holds on Metal, the scores of
+  causal text in the GEMM attention and its input on CUDA and ROCm),
+  qwen3_memory() (layer weights: device bf16; clean mapped pages on the CPU;
+  f32 with --no-mmap, twice that on Metal, whose cache copies them) and
+  iris_vae_memory_qimage(). Available: iris_dev_memory(held = 1) (Metal: the
+  working set budget, capped by free and file-backed pages and what the process
+  holds, since a new run replaces it; CUDA: free VRAM plus the scratch buffers a
+  run reuses) or 90% of the RAM on the CPU. A run that is short unloads what the
+  last one left (iris_unload_qimage(): transformer, VAE activations and device
+  weights), so a repeat is judged like a first run. Every reference run is
+  checked; a text-only run only past 1280 tokens, so short prompts need no
+  tokenizer and behave as before. The figures were measured on all three, ROCm
+  excepted.
+- Prefix: released after sampling when it has references or is past 1280 tokens
+  (iris_transformer_release_prefix_qimage()), so the decode and the next prompt
+  do not sit beside gigabytes nothing will read. Short text-only prefixes stay
+  for a repeated prompt.
+- Decode: dv_buffers() asks iris_dev_memory() first, since Metal allocates past
+  its budget. A decode that does not fit unloads the transformer.
+- Text-only: an encoder that does not fit beside the previous transformer
+  unloads the same (in iris_encode_text(), so the REPL does too).
+- Metal with mapped weights cannot run the CPU encoder path, so past 1280 tokens
+  without the device path the encoder fails with an error.
+- A free run with two or more references can end far from float32 although
+  each step does not: r9 (two references, a vague prompt) has velocities within
+  1.5-2.3% and the latent 28% off. A 1e-6 noise change moves it 2e-5, and the
+  float32 pipeline fed upstream's bf16 embeddings ends 21% off. A prompt that
+  pins the scene ends 3% off.
+
+# Qwen3-VL Vision Tower
+
+`qwen3_vision_encode()`, one image at a time (config in `text_encoder/config.json`):
+- Patches are block-major (block row, block column, row and column in block),
+  so merged rows are raster and each 2x2 block is contiguous.
+- Patch embedding: the Conv3d's temporal slices summed into one linear.
+  Position embedding: bilinear on the 48x48 table, align_corners.
+- 27 pre-norm blocks: `qkv` with bias, split-half RoPE (pairs (i, i + 36)) on Q
+  and K, no head norm, GELU-tanh MLP. Mergers use exact GELU; deepstack mergers
+  (after blocks 8, 16, 24) norm after flattening, the main one before.
+- The stream grows to rms 162, max 14000 in the last blocks, which amplifies
+  rounding: at 512x512 / 1024x1024, upstream f32 vs f64 is 2.4e-5 / 7.5e-5 on the
+  output, upstream bf16 vs f32 5% / 16%, iris on Metal 3% / 6% (input rounding,
+  not attention: f32 attention on the host still gives 5.4%).
+
+# Qwen-Image Known Pitfalls
+
+1. **Turbo sigmas go through the scheduler too**: the pipeline passes
+   sample_sigmas through the same set_timesteps as the base schedule. Turbo's
+   config turns dynamic shift and terminal stretch off, so they come out
+   unchanged; do not special-case Turbo, read the scheduler config.
+2. **DupUp shortcut**: `out[o, 2y+i, 2x+j] = in[(((o*ft + ft-1)*2+i)*2+j) /
+   repeats, y, x]` (first_chunk keeps temporal slot ft-1). It is not a plain
+   nearest upsample for the channel-reducing blocks.
+3. **Device path rounding**: bf16 activations give about 1% relative error vs
+   the float32 reference, the same as running upstream in bf16. Some reference
+   runs amplify it: a 1e-6 change of the noise moves the two-reference test
+   (r2) by 1e-5 against 1.7e-6 with one reference, so that run ends 3.8% off
+   on Metal and 4.4% off in upstream bf16, and 1e-4 off on the CPU in f32.
+   Long sequences do the same: 2100 and 3100 tokens end 2.5e-4 off on the CPU.
+   The ending point of such a run is one draw of the rounding: on r12, 1e-5 of
+   noise gives 2.3-4.2% on Metal and 1.9-9.2% on CUDA, and float32 inputs 2.9-7.2%
+   and 3.9-9.1%, with the same velocities (1-3%). So r2 ends 7.1% and r12 5.9% off
+   on CUDA (3.9% and 2.8% on Metal), the two-reference test measures 3.42 (1.86)
+   and its threshold is 6. One reference ends where Metal does (0.6-1.3%).
+   The Metal transformer sets the floor of a text-only run, not the encoder.
+   On the f32 CPU transformer the native encoder's text error moves the latent
+   0.6-2.4%, the device encoder's 0.1-0.9%. On Metal, float32 embeddings end
+   0.8-4.4% off, about where the device encoder ends. Native against device
+   then scatters both ways: over 13 text-only runs a run moved by 0.47x to 2.4x,
+   the geometric mean by 1.01x. Upstream bf16 is 4.5% on the same 256x256 run.
+4. **Causal device attention**: the prefill and the Qwen-Image encoder are the
+   causal callers of iris_dev_attention in MPS builds. Metal used to return without writing, so
+   text keys lost their attention output and velocities were 11-32% off.
+5. **VAE memory**: a 2048x2048 decode needs about 22 GB of GPU activations. When
+   they do not fit next to the transformer, it is unloaded first (the next
+   generation reloads it). The CPU decoder is the last resort: without BLAS it
+   takes minutes at 256x256.
 
 # Device Backend (CUDA / ROCm / Metal)
 
@@ -457,6 +667,10 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   Never key device data on host pointers (see the Metal pitfalls above).
 - GEMMs: bf16 inputs, f32 accumulation. Fused weights are assembled on the
   device with iris_dev_upload()/iris_dev_upload_2d().
+- iris_dev_copy_2d(): stream-ordered device-to-device bf16 copy (Qwen-Image
+  copies each block's cached text K|V into the shared QKV buffer with it).
+- iris_dev_rope(): split-half rotation without norm, any head_dim (the vision
+  tower: head_dim 72, attention takes the GEMM path on CUDA).
 - Attention: flash kernels for head_dim 128, non-causal, optional key mask
   (CUDA: mma.sync + cp.async + ldmatrix; ROCm: gfx11 WMMA, computing transposed
   products so each lane owns a query). Other cases use batched GEMMs around a
@@ -466,8 +680,9 @@ axes_dims_rope=[32,32,32,32], rope_theta=10000, flow_map=true (distilled).
   MTLBuffers, mapped back to (buffer, offset) by a sorted allocation table.
   Work goes into one command buffer, committed by sync/download/upload/free.
   GEMMs and attention use MPSGraph (bf16 matmul, fused SDPA on contiguous
-  copies of q/k/v). In MPS builds only the transformers use it: the Qwen3
-  and VAE device paths are compiled out (QWEN3_DEV / VAE_DEV).
+  copies of q/k/v, key mask and causal triangle as an additive bias). In MPS
+  builds the transformers, the Qwen-Image VAE and the Qwen-Image encoder use
+  it: the Flux VAE device path is compiled out (VAE_DEV).
 
 Known pitfalls:
 1. rocBLAS has only fallback (slow) bf16 -> f32 GEMM kernels on gfx1151:
@@ -477,6 +692,12 @@ Known pitfalls:
    staging path. GEMMs can read host memory fine, but uploads must not rely on it.
 3. RDNA3 WMMA: A/B operands hold a row/column per lane (replicated in both
    half-waves); the accumulator holds column lane%16, rows 2e + lane/16.
+4. A Metal command buffer holds 32 residency sets and an MPSGraph takes about
+   two. The VAE encodes dozens of shapes, which aborted at small sizes (large
+   ones hid it, MPSGraph commits by itself under load): run_graph flushes after
+   CMD_MAX_GRAPHS distinct graphs.
+5. Plain Metal tanh() returns NaN for large arguments (fast-math): use
+   precise::tanh().
 
 # Test Commands
 
@@ -484,6 +705,9 @@ Basic verification:
 ```bash
 make test
 ```
+
+`make test` starts with `make ropetest`, which needs no weights: rounding hides
+wrong text encoder positions in the images, so it checks the RoPE tables directly.
 
 Manual Flux sanity:
 ```bash
@@ -500,6 +724,12 @@ Manual FLUX.3 sanity:
 ```bash
 ./iris -d flux-3-klein -p "A fluffy orange cat sitting on a windowsill" \
   --seed 42 --steps 4 -W 256 -H 256 -o /tmp/flux3_test.png
+```
+
+Manual Qwen-Image sanity:
+```bash
+./iris -d qwen-image-2.1-turbo -p "A fluffy orange cat sitting on a windowsill" \
+  --seed 42 -W 256 -H 256 -o /tmp/qimage_test.png
 ```
 
 # Flux Known Pitfalls (Historical Bugs)

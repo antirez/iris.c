@@ -17,6 +17,9 @@ Supported model families:
   - **5.6B distilled** (16 steps by default, trained for 4 to 16, no CFG. FLUX Kommunity License).
   - **5.6B base** (50 steps, CFG. FLUX Kommunity License). Implemented but not tested yet: the weights were not accessible at the time of writing.
   - Text-to-image, editing (`-i image`) and multi-reference generation (`-i` repeated).
+- **[Qwen-Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)** (by Qwen):
+  - **Turbo** (fixed 8-step schedule, no CFG) and **base** (40 steps, no CFG). Qwen Research License (non-commercial).
+  - Text-to-image and editing (`-i image`, up to 16 references). Each reference is sized to about 1024x1024. The output size defaults to the last reference's aspect at about 1024x1024. A run that does not fit in memory is refused before it starts, for references and for prompts past 1280 tokens, a repeat in the same process included. Peak memory is about 24 GB for one reference and 48-51 GB for ten. The prompt and references can take up to 17280 text encoder tokens, and a reference takes about 1024.
 
 All the models run fully on the GPU with the Metal (Apple), CUDA (NVIDIA) and ROCm (AMD) backends.
 
@@ -70,6 +73,13 @@ For FLUX.3 Image Klein (gated, accept the license on HuggingFace first, ~20GB):
 ./iris -d flux-3-klein -p "a fish" -o fish.png
 ```
 
+For Qwen-Image 2.1 Turbo (~32GB, non-commercial license):
+```bash
+./download_model.sh qimage-turbo
+# or: python download_model.py qimage-turbo
+./iris -d qwen-image-2.1-turbo -p "a fish" -W 1024 -H 1024 -o fish.png
+```
+
 That's it. No Python runtime required at inference time.
 
 ## Example Output
@@ -90,7 +100,7 @@ That's it. No Python runtime required at inference time.
 - **GPU acceleration**: Metal on Apple Silicon Macs (automatic), CUDA on NVIDIA and ROCm on AMD GPUs. On Apple Silicon it is faster than PyTorch's optimized MPS pipeline
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
-- **Image-to-image**: Transform existing images guided by prompts (Flux models)
+- **Image-to-image**: Transform existing images guided by prompts (Flux and Qwen-Image models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model, Qwen3-VL 4B for FLUX.3), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
@@ -130,6 +140,7 @@ Transform an existing image based on a prompt:
 
 ```bash
 ./iris -d flux-klein-4b -p "oil painting style" -i photo.png -o painting.png
+./iris -d qwen-image-2.1-turbo -p "oil painting style" -i photo.png -o painting.png
 ```
 
 FLUX.2 uses **in-context conditioning** for image-to-image generation. Unlike traditional approaches that add noise to the input image, FLUX.2 passes the reference image as additional tokens that the model can attend to during generation. This means:
@@ -329,6 +340,7 @@ Run the test suite to verify your build produces correct output:
 ```bash
 make test        # Run all tests
 make test-quick  # Run only the quick 64x64 test
+make ropetest    # Check text encoder positions, no weights needed (part of make test)
 ```
 
 The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).
@@ -341,6 +353,8 @@ The tests compare generated images against reference images in `test_vectors/`. 
 | img2img | 256x256 | 4 | Validates image-to-image transformation |
 | Z-Image | 256x256 | 2 | Z-Image smoke test (auto-detected) |
 | FLUX.3 | 256x256 | 4 | FLUX.3 Klein against the official pipeline (auto-detected) |
+| Qwen-Image | 256x256 | 8 | Qwen-Image 2.1 Turbo against the official components (auto-detected) |
+| Qwen-Image edit | 512x512 | 8 | The same with a reference image against the official pipeline (auto-detected) |
 
 You can also run the test script directly for more options:
 ```bash
@@ -389,6 +403,13 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 # or: python download_model.py flux3 --token YOUR_TOKEN
 ```
 
+**Qwen-Image 2.1** (~32GB each, Qwen Research License, non-commercial):
+```bash
+./download_model.sh qimage-turbo    # Turbo, 8 steps
+./download_model.sh qimage          # base, 40 steps
+# or: python download_model.py qimage-turbo
+```
+
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
 | 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
@@ -398,6 +419,8 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
 | FLUX.3 distilled | `./flux-3-klein` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
 | FLUX.3 base | `./flux-3-klein-base` | ~20GB | VAE (~300MB), Transformer (~11GB), Qwen3-VL-4B (~9GB) |
+| Qwen-Image 2.1 Turbo | `./qwen-image-2.1-turbo` | ~32GB | VAE, Transformer (~7B, ~14GB), Qwen3-VL-8B (~16GB) |
+| Qwen-Image 2.1 base | `./qwen-image-2.1` | ~32GB | VAE, Transformer (~7B, ~14GB), Qwen3-VL-8B (~16GB) |
 
 ## How Fast Is It?
 
@@ -519,6 +542,23 @@ FLUX.3 processes three token modes (text, image, reference images): each first g
 
 Image tokens are modulated by the timestep, text and reference tokens by timestep 0. The distilled checkpoint is a flow map: every step is also told the timestep it jumps to. The prompt is padded to a multiple of 80 tokens and the transformer attends to the padding too, so the padding is part of the model recipe.
 
+### Qwen-Image 2.1
+
+Qwen-Image 2.1 runs single-stream blocks over `[TEXT | IMAGE]` with block-causal attention: text tokens are causal, image tokens see everything. Text is modulated from timestep 0, so it never depends on the image or the step: iris runs the prompt through the blocks once, keeps its keys and values, and every step then computes only the image tokens.
+
+| Component | Qwen-Image 2.1 |
+|-----------|----------------|
+| Transformer hidden | 4096 |
+| Attention heads | 32 (head dim 128) |
+| Blocks | 32 single-stream, one modulation shared by all |
+| Block | sequential attention then SwiGLU, tanh-gated residuals, no shift |
+| Image tokens | unpatched 64-channel latent pixels (16x16 image pixels each) |
+| RoPE | 3 axes (frame, h, w) = 16 + 56 + 56 dims, theta 10000; image grid centred on 0 |
+| Text Encoder | Qwen3-VL-8B text model, last layer before the final norm (4096 dims), system prompt tokens dropped |
+| VAE | Wan-derived, single frame (2D), 64 latent channels, 16x compression, RGBA output |
+
+With `-i`, a reference is resized to about 1024x1024 (`-W -H` only set the output, whose default follows the last reference) and enters twice. The Qwen3-VL vision tower feeds the text encoder: its embeddings fill the image's slots in the prompt and its deepstack features join the first three layers. The VAE encoder feeds the transformer: the reference latents replace those slots, so the prefix is `[text | reference | text]`, computed once like the prompt, and only the target runs at each step.
+
 ## Timestep Schedules
 
 Each model family has its own default schedule. Alternative schedules (`--linear`, `--power`, `--sigmoid`, `--flowmatch`) are available for experimentation. Any schedule can be used with any model.
@@ -568,6 +608,14 @@ FLUX.3 uses FlowMatch Euler with a large static shift (6.93), which keeps the no
 ```bash
 ./iris -d flux-3-klein -p "a fish" -o fish.png          # 16 steps
 ./iris -d flux-3-klein -p "a fish" -o fish.png -s 4     # 4x faster
+```
+
+### Qwen-Image 2.1
+
+Qwen-Image uses the FlowMatch Euler settings of its `scheduler/scheduler_config.json` (resolution-dependent shift, optional terminal stretch), applied to `linspace(1, 1/n, n)` for the base model (40 steps by default) and to the fixed sigma grid of `model_index.json` for Turbo, whose step count is the length of that grid:
+
+```bash
+./iris -d qwen-image-2.1 -p "a fish" -W 1024 -H 1024 -o fish.png -s 20
 ```
 
 ### Cross-model schedules

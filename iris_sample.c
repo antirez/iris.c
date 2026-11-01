@@ -7,6 +7,7 @@
 
 #include "iris.h"
 #include "iris_kernels.h"
+#include "iris_qimage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -231,6 +232,91 @@ float *iris_schedule_flux3(int num_steps) {
     }
     schedule[num_steps] = 0.0f;
 
+    return schedule;
+}
+
+/* Value of "key" in a flat JSON object: a number, true (1), false or null
+ * (0). Returns def when the key is absent. */
+static double json_number(const char *json, const char *key, double def) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p || !(p = strchr(p + strlen(pat), ':'))) return def;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!strncmp(p, "true", 4)) return 1;
+    if (!strncmp(p, "false", 5) || !strncmp(p, "null", 4)) return 0;
+    return atof(p);
+}
+
+/* Read scheduler/scheduler_config.json. Missing keys (or a missing file)
+ * keep the FlowMatchEulerDiscreteScheduler defaults. */
+void iris_qimage_sched_load(iris_qimage_sched_t *s, const char *model_dir) {
+    s->use_dynamic_shifting = 0;
+    s->base_seq_len = 256;
+    s->max_seq_len = 4096;
+    s->base_shift = 0.5f;
+    s->max_shift = 1.15f;
+    s->shift = 1.0f;
+    s->shift_terminal = 0.0f;
+    s->linear_time_shift = 0;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/scheduler/scheduler_config.json", model_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Warning: %s not found, using scheduler defaults\n", path);
+        return;
+    }
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    s->use_dynamic_shifting = (int)json_number(buf, "use_dynamic_shifting", 0);
+    s->base_seq_len = (float)json_number(buf, "base_image_seq_len", s->base_seq_len);
+    s->max_seq_len = (float)json_number(buf, "max_image_seq_len", s->max_seq_len);
+    s->base_shift = (float)json_number(buf, "base_shift", s->base_shift);
+    s->max_shift = (float)json_number(buf, "max_shift", s->max_shift);
+    s->shift = (float)json_number(buf, "shift", s->shift);
+    s->shift_terminal = (float)json_number(buf, "shift_terminal", 0);
+    s->linear_time_shift = strstr(buf, "\"linear\"") != NULL;
+    if (json_number(buf, "use_karras_sigmas", 0) || json_number(buf, "use_exponential_sigmas", 0) ||
+        json_number(buf, "use_beta_sigmas", 0) || json_number(buf, "invert_sigmas", 0))
+        fprintf(stderr, "Warning: unsupported sigma conversion in %s is ignored\n", path);
+}
+
+/*
+ * Qwen-Image 2.1 schedule. The pipeline hands Turbo's sample_sigmas, or
+ * linspace(1, 1/n, n) for the base model, to
+ * FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=..., mu=mu), which
+ * shifts them (resolution-dependent mu, or a static shift), optionally
+ * stretches them so the last one is shift_terminal, and appends 0.
+ */
+float *iris_schedule_qimage(const iris_qimage_sched_t *s, const float *sigmas,
+                            int num_steps, int image_seq_len) {
+    float *schedule = (float *)malloc((num_steps + 1) * sizeof(float));
+    double mu = s->base_shift + (image_seq_len - s->base_seq_len) *
+                (s->max_shift - s->base_shift) / (s->max_seq_len - s->base_seq_len);
+
+    for (int i = 0; i < num_steps; i++) {
+        double t = sigmas ? sigmas[i]
+                          : 1.0 + (1.0 / num_steps - 1.0) * (num_steps > 1 ? (double)i / (num_steps - 1) : 0.0);
+        if (s->use_dynamic_shifting) {
+            double e = s->linear_time_shift ? mu : exp(mu);
+            t = e / (e + (1.0 / t - 1.0));
+        } else {
+            t = s->shift * t / (1.0 + (s->shift - 1.0) * t);
+        }
+        schedule[i] = (float)t;
+    }
+    /* A lone sigma of 1 has nothing to stretch (upstream divides by zero). */
+    if (s->shift_terminal > 0 && schedule[num_steps - 1] < 1.0f) {
+        double scale = (1.0 - schedule[num_steps - 1]) / (1.0 - s->shift_terminal);
+        for (int i = 0; i < num_steps; i++)
+            schedule[i] = (float)(1.0 - (1.0 - schedule[i]) / scale);
+    }
+    schedule[num_steps] = 0.0f;
     return schedule;
 }
 
@@ -992,6 +1078,62 @@ float *iris_sample_euler_flux3(void *transformer,
 
     if (iris_verbose) {
         fprintf(stderr, "\nDenoising timing breakdown (FLUX.3):\n");
+        for (int step = 0; step < num_steps && step < IRIS_MAX_STEPS; step++)
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        double total = get_time_ms() - total_start;
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total, total / 1000.0);
+    }
+
+    return z_curr;
+}
+
+/* ========================================================================
+ * Qwen-Image 2.1 Sampler
+ * ======================================================================== */
+
+/* Euler sampler for Qwen-Image 2.1: z_{n+1} = z_n + (sigma_{n+1} - sigma_n) * v.
+ * No CFG (the models are sampled without guidance). The text prefix was
+ * prefilled before sampling, so each step only runs the image tokens. */
+float *iris_sample_euler_qimage(iris_transformer_qimage_t *tf,
+                                const float *z, int channels, int h, int w,
+                                const float *schedule, int num_steps,
+                                iris_vae_qimage_t *preview_vae) {
+    int latent_size = channels * h * w;
+    float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    iris_copy(z_curr, z, latent_size);
+
+    double total_start = get_time_ms();
+    double step_times[IRIS_MAX_STEPS];
+
+    for (int step = 0; step < num_steps; step++) {
+        float sigma = schedule[step];
+        float sigma_next = schedule[step + 1];
+        double step_start = get_time_ms();
+
+        if (iris_step_callback)
+            iris_step_callback(step + 1, num_steps);
+
+        float *v = iris_transformer_forward_qimage(tf, z_curr, h, w, sigma);
+        if (!v) {
+            free(z_curr);
+            return NULL;
+        }
+        iris_axpy(z_curr, sigma_next - sigma, v, latent_size);
+        free(v);
+
+        if (step < IRIS_MAX_STEPS) step_times[step] = get_time_ms() - step_start;
+
+        if (iris_step_image_callback && preview_vae && step + 1 < num_steps) {
+            iris_image *img = iris_vae_decode_qimage(preview_vae, z_curr, h, w);
+            if (img) {
+                iris_step_image_callback(step + 1, num_steps, img);
+                iris_image_free(img);
+            }
+        }
+    }
+
+    if (iris_verbose) {
+        fprintf(stderr, "\nDenoising timing breakdown (Qwen-Image):\n");
         for (int step = 0; step < num_steps && step < IRIS_MAX_STEPS; step++)
             fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
         double total = get_time_ms() - total_start;

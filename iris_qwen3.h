@@ -8,7 +8,9 @@
 #ifndef IRIS_QWEN3_H
 #define IRIS_QWEN3_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include "iris_safetensors.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +24,7 @@ extern "C" {
 #define QWEN3_VOCAB_SIZE       151936
 #define QWEN3_MAX_SEQ_LEN      512
 #define QWEN3_VL_MAX_SEQ_LEN   1280  /* Flux3 (Qwen3-VL): 16 windows of 80 tokens */
+#define QWEN3_QIMAGE_MAX_SEQ_LEN 17280  /* Qwen-Image: 16 references at 1 MP and a prompt */
 #define QWEN3_FLUX3_PAD_MULTIPLE 80  /* Flux3 pads the prompt to a multiple of this */
 #define QWEN3_RMS_NORM_EPS     1e-6f
 #define QWEN3_ROPE_THETA       1000000.0f
@@ -34,6 +37,10 @@ extern "C" {
 #define QWEN3_EXTRACT_FLUX     0
 #define QWEN3_EXTRACT_ZIMAGE   1
 #define QWEN3_EXTRACT_FLUX3    2
+#define QWEN3_EXTRACT_QIMAGE   3
+
+/* Qwen-Image 2.1 system message; its tokens are dropped from the output. */
+#define QWEN3_QIMAGE_SYSTEM "Comprehend and analyze the provided prompt."
 
 /* ========================================================================
  * Opaque Types
@@ -41,6 +48,15 @@ extern "C" {
 
 typedef struct qwen3_model qwen3_model_t;
 typedef struct qwen3_tokenizer qwen3_tokenizer_t;
+
+#define QWEN3_VISION_DEEPSTACK 3
+
+/* Vision tower output of one image, on its grid of h x w merged blocks. */
+typedef struct {
+    int h, w;
+    const float *embeds;                        /* [h * w, hidden] */
+    const float *deep[QWEN3_VISION_DEEPSTACK];  /* [h * w, hidden] each */
+} qwen3_image_t;
 
 /* ========================================================================
  * Tokenizer API
@@ -63,6 +79,25 @@ void qwen3_tokenizer_free(qwen3_tokenizer_t *tok);
  */
 int *qwen3_tokenize_chat(qwen3_tokenizer_t *tok, const char *prompt,
                          int *num_tokens, int max_len, int skip_think_tags);
+
+/*
+ * Tokenize with a system message and no <think> block (Qwen-Image 2.1):
+ * <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+ * num_system receives the number of system-block tokens.
+ */
+int *qwen3_tokenize_chat_system(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, int *num_tokens,
+                                int *num_system, int max_len);
+
+/*
+ * Same template with images in front of the prompt (Qwen-Image references):
+ * <|im_start|>user\n<image1><|vision_start|>{pad * slots[0]}<|vision_end|>
+ * then " <image2>..." for later images, then the prompt. image_rows[i]
+ * receives the first pad row of image i.
+ */
+int *qwen3_tokenize_chat_images(qwen3_tokenizer_t *tok, const char *system,
+                                const char *prompt, const int *slots, int n,
+                                int *num_tokens, int *num_system, int *image_rows);
 
 /*
  * Pad tokens to max_len with PAD token.
@@ -124,7 +159,7 @@ typedef struct qwen3_encoder {
 /*
  * Load complete text encoder (tokenizer + model).
  * model_dir should contain text_encoder/ and the tokenizer, either in
- * tokenizer/ or (Flux3) inside text_encoder/.
+ * tokenizer/, (Flux3) inside text_encoder/ or (Qwen-Image) in processor/.
  * use_mmap: if true, use memory-mapped bf16 weights (saves ~8GB, slower inference)
  */
 qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
@@ -134,6 +169,8 @@ qwen3_encoder_t *qwen3_encoder_load(const char *model_dir, int use_mmap);
  *   QWEN3_EXTRACT_FLUX:   hidden_states[9,18,27] concatenated -> [seq, 3*hidden]
  *   QWEN3_EXTRACT_ZIMAGE: hidden_states[-2] only -> [seq, hidden]
  *   QWEN3_EXTRACT_FLUX3:  hidden_states[4,8,...,32] -> [seq, 8*hidden]
+ *   QWEN3_EXTRACT_QIMAGE: last layer before the final norm -> [seq, hidden],
+ *                         system-block tokens dropped, padding not returned
  * Flux and Z-Image pad prompts to 512 tokens; Flux3 pads to a multiple of
  * 80 tokens and places the padding at RoPE position 1, like the
  * transformers version it was trained with.
@@ -162,6 +199,61 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
  */
 float *qwen3_encode_text_ex(qwen3_encoder_t *enc, const char *prompt,
                               int *out_num_tokens, int *out_seq_len);
+
+/*
+ * Bytes of the Qwen-Image encoder's weights in the memory the run is limited
+ * by, from the config: the f32 token embeddings, and the layers as bf16 on a
+ * GPU, as f32 without mmap, not at all as clean mapped pages. The model
+ * directory is the pipeline's.
+ */
+size_t qwen3_memory(const char *model_dir, int use_mmap);
+
+/*
+ * Encoder tokens of a Qwen-Image prompt with n images of slots[i] tokens,
+ * from the tokenizer alone (no encoder load). Returns 0 on failure.
+ */
+int qwen3_count_images(const char *model_dir, const char *prompt, const int *slots, int n);
+
+/*
+ * Encode a Qwen-Image prompt with n reference images, in
+ * QWEN3_EXTRACT_QIMAGE mode. Returns the text rows [*out_seq, hidden] without
+ * the image slots (caller frees); pos[i] receives the number of text rows
+ * before image i. Returns NULL above the encoder's token limit.
+ */
+float *qwen3_encode_images(qwen3_encoder_t *enc, const char *prompt,
+                           const qwen3_image_t *images, int n,
+                           int *out_seq, int *pos);
+
+/*
+ * Open the safetensors shards of model_dir (index, or a single file).
+ * Returns the number of files opened, 0 on failure.
+ */
+int open_safetensors_shards(const char *model_dir,
+                            safetensors_file_t **files, int max_files);
+
+/* ========================================================================
+ * Vision Tower (Qwen3-VL, iris_qwen3_vision.c)
+ * ======================================================================== */
+
+typedef struct qwen3_vision qwen3_vision_t;
+
+/*
+ * Open the model.visual.* weights of a text_encoder/ directory (shards or a
+ * single file). The weights stay mmapped; GPU builds upload them on the
+ * first image.
+ */
+qwen3_vision_t *qwen3_vision_load(const char *text_encoder_dir);
+
+void qwen3_vision_free(qwen3_vision_t *vision);
+
+/*
+ * Encode one image. rgb: [3, h, w], values 0..255; h and w multiples of 32.
+ * *embeds receives the main embeddings and deep[k] the deepstack features,
+ * each [tokens, 4096] in raster order of the merged blocks (caller frees).
+ * Returns tokens = (h / 32) * (w / 32), or 0 on failure.
+ */
+int qwen3_vision_encode(qwen3_vision_t *vision, const float *rgb, int h, int w,
+                        float **embeds, float *deep[QWEN3_VISION_DEEPSTACK]);
 
 #ifdef __cplusplus
 }

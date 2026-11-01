@@ -497,6 +497,10 @@ int iris_gpu_causal_attention_bf16(iris_gpu_tensor_t out,
                                     int seq, int num_q_heads, int num_kv_heads,
                                     int head_dim, float scale);
 
+/* The longest sequence of the causal attention kernels. iris_shaders.metal has
+ * the same limit: it sizes their threadgroup scores by it. */
+#define CAUSAL_ATTENTION_MAX_SEQ 1280
+
 /* BF16 RoPE for text encoder (Qwen3 style)
  * Q: [seq, num_q_heads * head_dim] (bf16) - modified in-place
  * K: [seq, num_kv_heads * head_dim] (bf16) - modified in-place

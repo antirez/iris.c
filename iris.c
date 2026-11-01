@@ -9,15 +9,20 @@
 #include "iris_kernels.h"
 #include "iris_safetensors.h"
 #include "iris_qwen3.h"
+#include "iris_qimage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#endif
+#ifdef IRIS_DEV
+#include "iris_dev.h"
 #endif
 
 /* ========================================================================
@@ -170,6 +175,22 @@ static float *iris_selected_flux3_schedule(const iris_params *p, int image_seq_l
     }
 }
 
+/* Return schedule for Qwen-Image models based on params. Default is the
+ * checkpoint's FlowMatch schedule (Turbo: its fixed sigma grid);
+ * overrides: linear, power, sigmoid, flowmatch (Z-Image's shift). */
+static float *iris_selected_qimage_schedule(const iris_params *p,
+                                            const iris_qimage_sched_t *sched,
+                                            const float *turbo_sigmas,
+                                            int image_seq_len) {
+    switch (p->schedule) {
+    case IRIS_SCHEDULE_LINEAR:    return iris_schedule_linear(p->num_steps);
+    case IRIS_SCHEDULE_POWER:     return iris_schedule_power(p->num_steps, p->power_alpha);
+    case IRIS_SCHEDULE_SIGMOID:   return iris_schedule_flux(p->num_steps, image_seq_len);
+    case IRIS_SCHEDULE_FLOWMATCH: return iris_schedule_zimage(p->num_steps, image_seq_len);
+    default: return iris_schedule_qimage(sched, turbo_sigmas, p->num_steps, image_seq_len);
+    }
+}
+
 /* Return schedule for Z-Image models based on params.
  * Default is FlowMatch Euler; overrides: linear, power, sigmoid. */
 static float *iris_selected_zimage_schedule(const iris_params *p, int image_seq_len) {
@@ -199,6 +220,8 @@ struct iris_ctx {
     iris_transformer_flux_t *transformer;
     zi_transformer_t *zi_transformer;
     iris_transformer_flux3_t *flux3_transformer;
+    iris_transformer_qimage_t *qimage_transformer;
+    iris_vae_qimage_t *qimage_vae;
 
     /* Configuration */
     int max_width;
@@ -211,6 +234,12 @@ struct iris_ctx {
     int num_heads;     /* Transformer attention heads (24 for 4B, 32 for 9B) */
     int is_zimage;     /* 1 = Z-Image S3-DiT, 0 = Flux MMDiT */
     int is_flux3;      /* 1 = FLUX.3 Image Klein */
+    int is_qimage;     /* 1 = Qwen-Image 2.1 (base or Turbo) */
+
+    /* Qwen-Image specific config */
+    iris_qimage_sched_t qimage_sched;         /* scheduler/scheduler_config.json */
+    float qimage_sigmas[QIMAGE_MAX_SIGMAS];   /* Turbo's sample_sigmas */
+    int qimage_num_sigmas;                    /* 0 for the base model */
 
     /* Z-Image specific config (from transformer/config.json) */
     int zi_dim;            /* Hidden dim (3840) */
@@ -263,6 +292,28 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+/* Parse the "sample_sigmas" array of model_index.json (Turbo's fixed grid)
+ * into out. Returns the count, 0 when absent or null (base model). */
+static int qimage_parse_sigmas(const char *json, float *out, int max) {
+    const char *p = strstr(json, "\"sample_sigmas\"");
+    if (!p || !(p = strchr(p, ':'))) return 0;
+    p += 1 + strspn(p + 1, " \t\r\n");
+    if (*p != '[') return 0;
+    int n = 0;
+    p++;
+    while (n < max) {
+        p += strspn(p, " \t\r\n");
+        if (*p == ']' || !*p) break;
+        char *end;
+        out[n] = strtof(p, &end);
+        if (end == p) break;
+        n++;
+        p = end + strspn(end, " \t\r\n");
+        if (*p == ',') p++;
+    }
+    return n;
+}
+
 /* Main model loading entry point. Parses model_index.json to auto-detect
  * the model type (Flux vs Z-Image, distilled vs base), then reads
  * transformer/config.json and vae/config.json for architecture parameters
@@ -301,6 +352,12 @@ iris_ctx *iris_load_dir(const char *model_dir) {
             if (strstr(buf, "ZImagePipeline") || strstr(buf, "Z-Image")) {
                 ctx->is_zimage = 1;
             }
+            /* Qwen-Image 2.1: Turbo is marked by its sample_sigmas grid */
+            if (strstr(buf, "QwenImage21Pipeline")) {
+                ctx->is_qimage = 1;
+                ctx->qimage_num_sigmas = qimage_parse_sigmas(buf, ctx->qimage_sigmas,
+                                                             QIMAGE_MAX_SIGMAS);
+            }
             /* If "is_distilled" is present and true, it's distilled.
              * If absent, it's the base model. */
             if (!strstr(buf, "\"is_distilled\": true") &&
@@ -330,6 +387,9 @@ iris_ctx *iris_load_dir(const char *model_dir) {
                 if ((p = strchr(p, ':'))) joint_dim = atoi(p + 1);
             }
             if (joint_dim > 0) ctx->text_dim = joint_dim;
+            if (ctx->is_qimage && (p = strstr(buf, "\"context_in_dim\"")) &&
+                (p = strchr(p, ':')))
+                ctx->text_dim = atoi(p + 1);
 
             /* Z-Image autodetection: look for Z-Image-specific fields */
             if ((p = strstr(buf, "\"cap_feat_dim\""))) {
@@ -470,6 +530,17 @@ iris_ctx *iris_load_dir(const char *model_dir) {
         ctx->is_distilled = 1;        /* Treat as distilled (no CFG) */
         snprintf(ctx->model_name, sizeof(ctx->model_name),
                  "Z-Image-Turbo-%s", size_label);
+    } else if (ctx->is_qimage) {
+        /* Both variants are sampled without guidance; Turbo's step count
+         * is the length of its sigma grid. */
+        ctx->num_heads = num_heads;
+        ctx->is_non_commercial = 1;   /* Qwen Research License */
+        ctx->is_distilled = 1;        /* No CFG */
+        ctx->default_steps = ctx->qimage_num_sigmas ? ctx->qimage_num_sigmas : 40;
+        ctx->default_guidance = 0.0f;
+        iris_qimage_sched_load(&ctx->qimage_sched, model_dir);
+        snprintf(ctx->model_name, sizeof(ctx->model_name),
+                 ctx->qimage_num_sigmas ? "Qwen-Image-2.1-Turbo" : "Qwen-Image-2.1");
     } else if (ctx->is_flux3) {
         ctx->num_heads = num_heads;
         ctx->is_non_commercial = 1;   /* FLUX Kommunity License */
@@ -500,7 +571,9 @@ iris_ctx *iris_load_dir(const char *model_dir) {
      * Transformer and text encoder are loaded on-demand during generation
      * to support systems with limited RAM (e.g., 16GB). */
     snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", model_dir);
-    if (file_exists(path)) {
+    if (ctx->is_qimage) {
+        ctx->qimage_vae = iris_vae_load_qimage(model_dir);
+    } else if (file_exists(path)) {
         safetensors_file_t *sf = safetensors_open(path);
         if (sf) {
             ctx->vae = iris_vae_load_safetensors_ex(sf,
@@ -510,7 +583,7 @@ iris_ctx *iris_load_dir(const char *model_dir) {
     }
 
     /* Verify VAE is loaded */
-    if (!ctx->vae) {
+    if (!ctx->vae && !ctx->qimage_vae) {
         set_error("Failed to load VAE - cannot generate images");
         iris_free(ctx);
         return NULL;
@@ -544,6 +617,8 @@ void iris_free(iris_ctx *ctx) {
     iris_transformer_free_flux(ctx->transformer);
     iris_transformer_free_zimage(ctx->zi_transformer);
     iris_transformer_free_flux3(ctx->flux3_transformer);
+    iris_transformer_free_qimage(ctx->qimage_transformer);
+    iris_vae_free_qimage(ctx->qimage_vae);
 
     free(ctx);
 }
@@ -564,6 +639,10 @@ int iris_is_flux3(iris_ctx *ctx) {
     return ctx ? ctx->is_flux3 : 0;
 }
 
+int iris_is_qimage(iris_ctx *ctx) {
+    return ctx ? ctx->is_qimage : 0;
+}
+
 int iris_default_steps(iris_ctx *ctx) {
     return ctx ? ctx->default_steps : 4;
 }
@@ -573,8 +652,9 @@ float iris_default_guidance(iris_ctx *ctx) {
 }
 
 void iris_set_base_mode(iris_ctx *ctx) {
-    /* FLUX.3 checkpoints declare whether they are flow maps (distilled). */
-    if (!ctx || ctx->is_flux3) return;
+    /* FLUX.3 checkpoints declare whether they are flow maps (distilled);
+     * Qwen-Image never uses CFG. */
+    if (!ctx || ctx->is_flux3 || ctx->is_qimage) return;
     ctx->is_distilled = 0;
     ctx->default_steps = 50;
     ctx->default_guidance = 4.0f;
@@ -638,6 +718,21 @@ static int iris_load_flux3_transformer_if_needed(iris_ctx *ctx) {
     return 1;
 }
 
+/* Load Qwen-Image transformer on-demand if not already loaded */
+static int iris_load_qimage_transformer_if_needed(iris_ctx *ctx) {
+    if (ctx->qimage_transformer) return 1;
+
+    if (iris_phase_callback) iris_phase_callback("Loading Qwen-Image transformer", 0);
+    ctx->qimage_transformer = iris_transformer_load_qimage(ctx->model_dir);
+    if (iris_phase_callback) iris_phase_callback("Loading Qwen-Image transformer", 1);
+
+    if (!ctx->qimage_transformer) {
+        set_error("Failed to load Qwen-Image transformer");
+        return 0;
+    }
+    return 1;
+}
+
 /* Load Z-Image transformer on-demand if not already loaded */
 static int iris_load_zimage_transformer_if_needed(iris_ctx *ctx) {
     if (ctx->zi_transformer) return 1;  /* Already loaded */
@@ -662,6 +757,7 @@ void *iris_get_transformer(iris_ctx *ctx) {
     if (!ctx) return NULL;
     if (ctx->is_zimage) return ctx->zi_transformer;
     if (ctx->is_flux3) return ctx->flux3_transformer;
+    if (ctx->is_qimage) return ctx->qimage_transformer;
     return ctx->transformer;
 }
 
@@ -669,29 +765,64 @@ void *iris_get_transformer(iris_ctx *ctx) {
  * Text Encoding
  * ======================================================================== */
 
-/* Run the prompt through Qwen3 to produce text embeddings. For Flux models,
- * hidden states from layers 8, 17, 26 are concatenated to form [512, text_dim].
- * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
- * count via out_seq_len. The returned embedding buffer is still max-seq padded;
- * Z-Image consumes only the first out_seq_len tokens. */
-float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
-    if (!ctx || !prompt) {
-        *out_seq_len = 0;
-        return NULL;
-    }
-
-    /* Load encoder if not already loaded */
+/* Load the encoder if needed and select which hidden states form the
+ * embeddings. ctx->qwen3_encoder stays NULL if it cannot be loaded. */
+static void iris_load_text_encoder_if_needed(iris_ctx *ctx) {
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
         if (iris_phase_callback) iris_phase_callback("Loading Qwen3 encoder", 1);
         if (!ctx->qwen3_encoder) {
             fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
+            return;
         }
     }
+    if (ctx->qwen3_encoder) {
+        qwen3_set_extraction_mode(ctx->qwen3_encoder,
+            ctx->is_zimage ? QWEN3_EXTRACT_ZIMAGE :
+            ctx->is_flux3 ? QWEN3_EXTRACT_FLUX3 :
+            ctx->is_qimage ? QWEN3_EXTRACT_QIMAGE : QWEN3_EXTRACT_FLUX);
+    }
+}
 
+/* Run the prompt through Qwen3 to produce text embeddings. For Flux models,
+ * hidden states from layers 8, 17, 26 are concatenated to form [512, text_dim].
+ * For Z-Image, takes hidden_states[-2] and reports the real (unpadded) token
+ * count via out_seq_len. The returned embedding buffer is still max-seq padded;
+ * Z-Image consumes only the first out_seq_len tokens. */
+/* Drop what a Qwen-Image run leaves on the device, so a stage that does not fit
+ * beside it gets the room of a first run. All of it reloads at the next use. */
+static void iris_unload_qimage(iris_ctx *ctx) {
+    iris_transformer_free_qimage(ctx->qimage_transformer);
+    ctx->qimage_transformer = NULL;
+    iris_vae_release_qimage(ctx->qimage_vae);
+}
+
+/* Memory a stage can use: device memory on a GPU (iris_dev_memory()), otherwise
+ * most of the RAM. */
+static size_t iris_available_memory(int held) {
+#ifdef IRIS_DEV
+    if (iris_dev_available()) return iris_dev_memory(held);
+#else
+    (void)held;
+#endif
+    return (size_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 10 * 9;
+}
+
+float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
+    if (!ctx || !prompt) {
+        *out_seq_len = 0;
+        return NULL;
+    }
+
+    /* The encoder sits beside a previous generation's transformer if it fits. */
+    if (ctx->qimage_transformer && !ctx->qwen3_encoder &&
+        qwen3_memory(ctx->model_dir, ctx->use_mmap) > iris_available_memory(0))
+        iris_unload_qimage(ctx);
+
+    iris_load_text_encoder_if_needed(ctx);
     if (!ctx->qwen3_encoder) {
-        if (ctx->is_zimage || ctx->is_flux3) {
+        if (ctx->is_zimage || ctx->is_flux3 || ctx->is_qimage) {
             /* The sequence length depends on the prompt's token count. */
             *out_seq_len = 0;
             set_error("Qwen3 text encoder unavailable");
@@ -702,11 +833,6 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
         return (float *)calloc(QWEN3_MAX_SEQ_LEN * ctx->text_dim, sizeof(float));
     }
 
-    /* Set extraction mode: which hidden states form the embeddings */
-    qwen3_set_extraction_mode(ctx->qwen3_encoder,
-        ctx->is_zimage ? QWEN3_EXTRACT_ZIMAGE :
-        ctx->is_flux3 ? QWEN3_EXTRACT_FLUX3 : QWEN3_EXTRACT_FLUX);
-
     /* Encode text using Qwen3 */
     if (iris_phase_callback) iris_phase_callback("encoding text", 0);
 
@@ -716,7 +842,8 @@ float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (iris_phase_callback) iris_phase_callback("encoding text", 1);
 
     /* Z-Image uses only the real tokens of the padded embedding buffer,
-     * Flux (512) and Flux3 (multiple of 80) attend to the padding too. */
+     * Flux (512) and Flux3 (multiple of 80) attend to the padding too.
+     * Qwen-Image gets its real tokens only (both counts are equal). */
     *out_seq_len = ctx->is_zimage ? num_real_tokens : padded_len;
     return embeddings;
 }
@@ -1129,6 +1256,349 @@ static iris_image *iris_generate_flux3(iris_ctx *ctx, const char *prompt,
 }
 
 /* ========================================================================
+ * Qwen-Image Generation
+ * ======================================================================== */
+
+/* Floor the target size to multiples of 32 like the reference pipeline and
+ * check it. Returns 0 if it is too large. */
+static int iris_size_qimage(iris_params *p) {
+    if (p->width <= 0) p->width = IRIS_DEFAULT_WIDTH;
+    if (p->height <= 0) p->height = IRIS_DEFAULT_HEIGHT;
+    p->width = (p->width / 32) * 32;
+    p->height = (p->height / 32) * 32;
+    if (p->width < 64) p->width = 64;
+    if (p->height < 64) p->height = 64;
+    if (p->width > IRIS_QIMAGE_MAX_DIM || p->height > IRIS_QIMAGE_MAX_DIM ||
+        (long)p->width * p->height > IRIS_QIMAGE_MAX_PIXELS) {
+        set_error("Image dimensions exceed maximum (2816 per side, 2752x1536 pixels)");
+        return 0;
+    }
+    return 1;
+}
+
+/* Qwen-Image generation from text embeddings [text_seq, text_dim] (real
+ * tokens only) and n reference latents: prefill the prefix, denoise a latent
+ * [64, H/16, W/16] (the given noise, or noise from the seed) and decode it
+ * with the Qwen-Image VAE. Turbo uses its fixed sigma grid unless another
+ * schedule is requested. out_latent, if not NULL, receives the final latent
+ * (caller frees). */
+static iris_image *iris_generate_qimage_with_embeddings(iris_ctx *ctx,
+                                                        const float *text_emb, int text_seq,
+                                                        const iris_qimage_ref_t *refs, int n,
+                                                        const float *noise, int noise_size,
+                                                        const iris_params *params,
+                                                        float **out_latent) {
+    iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+    if (!iris_size_qimage(&p)) return NULL;
+
+    int turbo = ctx->qimage_num_sigmas > 0 && p.schedule == IRIS_SCHEDULE_DEFAULT;
+    if (turbo) {
+        if (p.num_steps > 0 && p.num_steps != ctx->qimage_num_sigmas)
+            fprintf(stderr, "Note: Turbo uses its fixed %d-step schedule, ignoring %d steps\n",
+                    ctx->qimage_num_sigmas, p.num_steps);
+        p.num_steps = ctx->qimage_num_sigmas;
+    } else if (p.num_steps <= 0) {
+        p.num_steps = ctx->default_steps;
+    }
+
+    int latent_h = p.height / 16, latent_w = p.width / 16;
+    int image_seq_len = latent_h * latent_w;
+    int channels = IRIS_QIMAGE_LATENT_CHANNELS;
+    if (noise && noise_size != channels * image_seq_len) {
+        char err[256];
+        snprintf(err, sizeof(err), "Noise size mismatch: got %d, expected %d",
+                 noise_size, channels * image_seq_len);
+        set_error(err);
+        return NULL;
+    }
+
+    iris_release_text_encoder(ctx);
+    if (!iris_load_qimage_transformer_if_needed(ctx)) return NULL;
+    if (iris_transformer_channels_qimage(ctx->qimage_transformer) != channels) {
+        set_error("Unexpected Qwen-Image latent channel count");
+        return NULL;
+    }
+
+    if (iris_phase_callback) iris_phase_callback("processing prompt", 0);
+    int ok = iris_transformer_prefill_qimage(ctx->qimage_transformer, text_emb, text_seq,
+                                             refs, n);
+    if (iris_phase_callback) iris_phase_callback("processing prompt", 1);
+    if (!ok) {
+        set_error("Qwen-Image text prefill failed");
+        return NULL;
+    }
+
+    float *z;
+    if (noise) {
+        z = malloc((size_t)noise_size * sizeof(float));
+        memcpy(z, noise, (size_t)noise_size * sizeof(float));
+    } else {
+        int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+        z = iris_init_noise(1, channels, latent_h, latent_w, seed);
+    }
+    float *schedule = iris_selected_qimage_schedule(&p, &ctx->qimage_sched,
+                                                    turbo ? ctx->qimage_sigmas : NULL,
+                                                    image_seq_len);
+    float *latent = iris_sample_euler_qimage(ctx->qimage_transformer, z, channels,
+                                             latent_h, latent_w, schedule, p.num_steps,
+                                             ctx->qimage_vae);
+    free(z);
+    free(schedule);
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    /* A reference run never repeats its prefill, and a long prefix takes GBs. */
+    if (n > 0 || text_seq > QWEN3_VL_MAX_SEQ_LEN)
+        iris_transformer_release_prefix_qimage(ctx->qimage_transformer);
+
+    /* A large decode can need more GPU memory than the transformer leaves. */
+    int evicted = 0;
+    if (!iris_vae_reserve_qimage(ctx->qimage_vae, latent_h, latent_w)) {
+        fprintf(stderr, "Note: unloading the transformer to fit the VAE on the GPU\n");
+        iris_transformer_free_qimage(ctx->qimage_transformer);
+        ctx->qimage_transformer = NULL;
+        evicted = 1;
+    }
+
+    if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+    iris_image *img = iris_vae_decode_qimage(ctx->qimage_vae, latent, latent_h, latent_w);
+    if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    if (evicted) iris_vae_release_qimage(ctx->qimage_vae);   /* room to reload it */
+    if (out_latent) *out_latent = latent;
+    else free(latent);
+    return img;
+}
+
+/* What the sequence limit and the memory of this machine allow: refuse a run
+ * before any stage has spent time on it. tokens: text encoder sequence, rows:
+ * prefix and target tokens, text_rows: those that are text, h x w: target
+ * latent. The stages run one at a time, except that a decode too large for the
+ * transformer's company unloads it. */
+static int iris_fit_qimage(iris_ctx *ctx, int tokens, int rows, int text_rows, int h, int w) {
+    int limit = QWEN3_QIMAGE_MAX_SEQ_LEN;
+#ifdef USE_METAL
+    if (ctx->use_mmap && !iris_dev_available()) limit = CAUSAL_ATTENTION_MAX_SEQ;
+#endif
+    char err[160];
+    if (tokens <= 0 || tokens > limit) {
+        snprintf(err, sizeof(err), "The prompt and its references need %d text encoder "
+                 "tokens, the limit is %d", tokens, limit);
+        set_error(err);
+        return 0;
+    }
+    size_t need = iris_transformer_memory_qimage(ctx->model_dir, rows, text_rows);
+    size_t text = qwen3_memory(ctx->model_dir, ctx->use_mmap);
+    size_t decode = iris_vae_memory_qimage(ctx->qimage_vae, h, w);
+    if (text > need) need = text;
+    if (decode > need) need = decode;
+    size_t have = iris_available_memory(1);
+    if (need > have) {
+        iris_unload_qimage(ctx);
+        have = iris_available_memory(1);
+    }
+    if (need > have) {
+        snprintf(err, sizeof(err), "This run needs about %.1f GB of memory, %.1f GB are "
+                 "available", need / 1e9, have / 1e9);
+        set_error(err);
+        return 0;
+    }
+    return 1;
+}
+
+static iris_image *iris_generate_qimage(iris_ctx *ctx, const char *prompt,
+                                        const iris_params *params) {
+    /* A token takes at least one byte, so a short prompt needs no tokenizer. */
+    if (strlen(prompt) > QWEN3_VL_MAX_SEQ_LEN) {
+        int tokens = qwen3_count_images(ctx->model_dir, prompt, NULL, 0);
+        if (tokens > QWEN3_QIMAGE_MAX_SEQ_LEN) tokens = QWEN3_QIMAGE_MAX_SEQ_LEN;  /* cut */
+        iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+        if (!iris_size_qimage(&p)) return NULL;
+        int h = p.height / 16, w = p.width / 16;
+        if (tokens > QWEN3_VL_MAX_SEQ_LEN &&
+            !iris_fit_qimage(ctx, tokens, tokens + h * w, tokens, h, w))
+            return NULL;
+    }
+
+    int text_seq;
+    float *text_emb = iris_encode_text(ctx, prompt, &text_seq);
+    if (!text_emb) {
+        set_error("Failed to encode prompt");
+        return NULL;
+    }
+    iris_image *img = iris_generate_qimage_with_embeddings(ctx, text_emb, text_seq, NULL, 0,
+                                                           NULL, 0, params, NULL);
+    free(text_emb);
+    return img;
+}
+
+/* VAE latents of the prepared references, then release the encoder. */
+static int iris_encode_refs_qimage(iris_ctx *ctx, iris_image **rgba,
+                                   iris_qimage_ref_t *refs, int n) {
+    int ok = 1;
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 0);
+    for (int i = 0; i < n && ok; i++) {
+        float *pixels = iris_ref_pixels_qimage(rgba[i]);
+        float *latent = pixels ? iris_vae_encode_qimage(ctx->qimage_vae, pixels,
+                                                        rgba[i]->height, rgba[i]->width) : NULL;
+        free(pixels);
+        refs[i].h = rgba[i]->height / 16;
+        refs[i].w = rgba[i]->width / 16;
+        refs[i].latent = latent;
+        ok = latent != NULL;
+    }
+    iris_vae_release_qimage(ctx->qimage_vae);
+    if (iris_phase_callback) iris_phase_callback("encoding reference image", 1);
+    return ok;
+}
+
+/* Vision tower outputs of the prepared references, on planar RGB over white. */
+static int iris_vision_refs_qimage(iris_ctx *ctx, iris_image **rgba,
+                                   qwen3_image_t *images, int n) {
+    char dir[sizeof(ctx->model_dir) + 16];
+    snprintf(dir, sizeof(dir), "%s/text_encoder", ctx->model_dir);
+    if (iris_phase_callback) iris_phase_callback("encoding reference vision", 0);
+    qwen3_vision_t *vision = qwen3_vision_load(dir);
+    int ok = vision != NULL;
+    for (int i = 0; i < n && ok; i++) {
+        int h = rgba[i]->height, w = rgba[i]->width;
+        iris_image *rgb = iris_ref_vision_qimage(rgba[i]);
+        float *planes = malloc((size_t)3 * h * w * sizeof(float));
+        ok = 0;
+        if (rgb && planes) {
+            for (size_t p = 0; p < (size_t)h * w; p++)
+                for (int c = 0; c < 3; c++)
+                    planes[c * (size_t)h * w + p] = rgb->data[p * 3 + c];
+            float *embeds, *deep[QWEN3_VISION_DEEPSTACK];
+            ok = qwen3_vision_encode(vision, planes, h, w, &embeds, deep) > 0;
+            if (ok) {
+                images[i].h = h / 32;
+                images[i].w = w / 32;
+                images[i].embeds = embeds;
+                for (int k = 0; k < QWEN3_VISION_DEEPSTACK; k++) images[i].deep[k] = deep[k];
+            }
+        }
+        free(planes);
+        iris_image_free(rgb);
+    }
+    qwen3_vision_free(vision);
+    if (iris_phase_callback) iris_phase_callback("encoding reference vision", 1);
+    return ok;
+}
+
+/* iris_fit_qimage() from the token count of the prompt and the references. */
+static int iris_refs_fit_qimage(iris_ctx *ctx, const char *prompt, iris_image **rgba, int n,
+                                int h, int w) {
+    int *slots = malloc(n * sizeof(int));
+    if (!slots) {
+        set_error("Out of memory");
+        return 0;
+    }
+    int slot_tokens = 0, ref_tokens = 0;
+    for (int i = 0; i < n; i++) {
+        slots[i] = rgba[i]->height / 32 * (rgba[i]->width / 32);
+        slot_tokens += slots[i];
+        ref_tokens += rgba[i]->height / 16 * (rgba[i]->width / 16);
+    }
+    int tokens = qwen3_count_images(ctx->model_dir, prompt, slots, n);
+    free(slots);
+    return iris_fit_qimage(ctx, tokens, tokens - slot_tokens + ref_tokens + h * w,
+                           tokens - slot_tokens, h, w);
+}
+
+/* The pipeline with reference images, one stage at a time so that each is
+ * freed before the next loads: prepare, VAE encoder, vision tower, text
+ * encoder, then the common prefill, sampling and decode. Without an explicit
+ * size the target follows the last reference. ref_area is the reference area,
+ * IRIS_QIMAGE_REF_AREA upstream. */
+iris_image *iris_generate_refs_qimage(iris_ctx *ctx, const char *prompt,
+                                      const iris_image **refs, int n, int ref_area,
+                                      const float *noise, int noise_size,
+                                      const iris_params *params, float **out_latent) {
+    iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+    iris_ref_size_qimage(refs[n - 1]->width, refs[n - 1]->height, ref_area, &p.width, &p.height);
+    if (params && params->width > 0) p.width = params->width;
+    if (params && params->height > 0) p.height = params->height;
+    if (!iris_size_qimage(&p)) return NULL;
+
+    iris_image **rgba = calloc(n, sizeof(*rgba));
+    iris_qimage_ref_t *ref = calloc(n, sizeof(*ref));
+    qwen3_image_t *images = calloc(n, sizeof(*images));
+    int *pos = calloc(n, sizeof(*pos));
+    float *text_emb = NULL;
+    iris_image *img = NULL;
+    if (!rgba || !ref || !images || !pos) {
+        set_error("Out of memory");
+        goto done;
+    }
+
+    int text_seq;
+    for (int i = 0; i < n; i++) {
+        rgba[i] = iris_ref_prepare_qimage(refs[i], ref_area);
+        if (!rgba[i]) {
+            set_error("Failed to prepare a reference image");
+            goto done;
+        }
+    }
+    if (!iris_refs_fit_qimage(ctx, prompt, rgba, n, p.height / 16, p.width / 16)) goto done;
+
+    /* A previous generation's transformer would sit beside all three encoders. */
+    iris_transformer_free_qimage(ctx->qimage_transformer);
+    ctx->qimage_transformer = NULL;
+
+    if (!iris_encode_refs_qimage(ctx, rgba, ref, n)) {
+        set_error("Failed to encode a reference image");
+        goto done;
+    }
+    if (!iris_vision_refs_qimage(ctx, rgba, images, n)) {
+        set_error("Failed to run the vision tower");
+        goto done;
+    }
+
+    iris_load_text_encoder_if_needed(ctx);
+    if (!ctx->qwen3_encoder) {
+        set_error("Qwen3 text encoder unavailable");
+        goto done;
+    }
+    if (iris_phase_callback) iris_phase_callback("encoding text", 0);
+    text_emb = qwen3_encode_images(ctx->qwen3_encoder, prompt, images, n, &text_seq, pos);
+    if (iris_phase_callback) iris_phase_callback("encoding text", 1);
+    if (!text_emb) {
+        set_error("Failed to encode the prompt with its references");
+        goto done;
+    }
+    for (int i = 0; i < n; i++) {
+        free((void *)images[i].embeds);
+        images[i].embeds = NULL;
+        for (int k = 0; k < QWEN3_VISION_DEEPSTACK; k++) {
+            free((void *)images[i].deep[k]);
+            images[i].deep[k] = NULL;
+        }
+        ref[i].pos = pos[i];
+    }
+
+    img = iris_generate_qimage_with_embeddings(ctx, text_emb, text_seq, ref, n,
+                                               noise, noise_size, &p, out_latent);
+
+done:
+    free(text_emb);
+    for (int i = 0; i < n; i++) {
+        if (rgba) iris_image_free(rgba[i]);
+        if (ref) free((void *)ref[i].latent);
+        if (images) {
+            free((void *)images[i].embeds);
+            for (int k = 0; k < QWEN3_VISION_DEEPSTACK; k++) free((void *)images[i].deep[k]);
+        }
+    }
+    free(rgba);
+    free(ref);
+    free(images);
+    free(pos);
+    return img;
+}
+
+/* ========================================================================
  * Image Generation
  * ======================================================================== */
 
@@ -1151,6 +1621,9 @@ iris_image *iris_generate(iris_ctx *ctx, const char *prompt,
     }
     if (ctx->is_flux3) {
         return iris_generate_flux3(ctx, prompt, params);
+    }
+    if (ctx->is_qimage) {
+        return iris_generate_qimage(ctx, prompt, params);
     }
 
     /* Use defaults if params is NULL */
@@ -1283,6 +1756,10 @@ iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
     if (ctx->is_zimage) {
         return iris_generate_zimage_with_embeddings(ctx, text_emb, text_seq, params);
     }
+    if (ctx->is_qimage) {
+        return iris_generate_qimage_with_embeddings(ctx, text_emb, text_seq, NULL, 0,
+                                                    NULL, 0, params, NULL);
+    }
 
     /* This API only supports the distilled (non-CFG) sampler since the
      * caller provides a single embedding.  Warn if used with a base model
@@ -1379,6 +1856,10 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
         return NULL;
     }
 
+    if (ctx->is_qimage) {
+        return iris_generate_qimage_with_embeddings(ctx, text_emb, text_seq, NULL, 0,
+                                                    noise, noise_size, params, NULL);
+    }
     if (ctx->is_zimage || ctx->is_flux3) {
         set_error("This model does not support the external embedding/noise "
                   "generation API. Use iris_generate() with a prompt.");
@@ -1552,6 +2033,9 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
         set_error("img2img is not supported for Z-Image");
         return NULL;
     }
+    if (ctx->is_qimage)
+        return iris_generate_refs_qimage(ctx, prompt, &input, 1, IRIS_QIMAGE_REF_AREA,
+                                         NULL, 0, params, NULL);
     if (ctx->is_flux3) return iris_generate_flux3_refs(ctx, prompt, &input, 1, params);
 
     iris_params p;
@@ -1762,6 +2246,9 @@ iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
         set_error("multi-reference img2img is not supported for Z-Image");
         return NULL;
     }
+    if (ctx->is_qimage && refs && num_refs > 0)
+        return iris_generate_refs_qimage(ctx, prompt, refs, num_refs, IRIS_QIMAGE_REF_AREA,
+                                         NULL, 0, params, NULL);
     if (ctx->is_flux3 && refs && num_refs > 0)
         return iris_generate_flux3_refs(ctx, prompt, refs, num_refs, params);
 
@@ -1993,6 +2480,7 @@ const char *iris_model_info(iris_ctx *ctx) {
         return "No model loaded";
     }
     if (ctx->is_zimage) type = "zimage";
+    else if (ctx->is_qimage) type = ctx->qimage_num_sigmas ? "turbo" : "base, no CFG";
     else type = ctx->is_distilled ? "distilled" : "base";
     snprintf(info, sizeof(info), "%s v%s (%s, %d steps, guidance %.1f)",
              ctx->model_name, ctx->model_version,
@@ -2007,6 +2495,11 @@ int iris_text_dim(iris_ctx *ctx) {
 
 const char *iris_license_notice(iris_ctx *ctx) {
     if (!ctx || !ctx->is_non_commercial) return NULL;
+    if (ctx->is_qimage) {
+        return "This model is released under the Qwen Research License:\n"
+               "non-commercial use only; commercial use needs a license from Qwen.\n"
+               "https://huggingface.co/Qwen/Qwen-Image-2.1";
+    }
     if (ctx->is_flux3) {
         return "This model is released under the FLUX Kommunity License:\n"
                "non-commercial use, plus commercial use of the outputs for\n"
@@ -2050,9 +2543,11 @@ float *iris_encode_image(iris_ctx *ctx, const iris_image *img,
  * Latent dimensions are 1/16 of the output pixel dimensions. */
 iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
                                int latent_h, int latent_w) {
-    if (!ctx || !latent || !ctx->vae) return NULL;
+    if (!ctx || !latent || (!ctx->vae && !ctx->qimage_vae)) return NULL;
     if (iris_phase_callback) iris_phase_callback("decoding image", 0);
-    iris_image *img = iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
+    iris_image *img = ctx->qimage_vae
+        ? iris_vae_decode_qimage(ctx->qimage_vae, latent, latent_h, latent_w)
+        : iris_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
     if (iris_phase_callback) iris_phase_callback("decoding image", 1);
     return img;
 }

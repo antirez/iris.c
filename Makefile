@@ -1,5 +1,5 @@
 # Iris - C Image Generation Engine
-# Supported models: FLUX.2 Klein (4B/9B), Z-Image-Turbo (6B), FLUX.3 Image Klein
+# Supported models: FLUX.2 Klein (4B/9B), Z-Image-Turbo (6B), FLUX.3 Image Klein, Qwen-Image 2.1
 # Makefile
 
 CC = gcc
@@ -11,7 +11,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_transformer_flux3.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_tokenizer.c terminals.c
+SRCS = iris.c iris_kernels.c iris_tokenizer.c iris_vae.c iris_transformer_flux.c iris_transformer_zimage.c iris_transformer_flux3.c iris_transformer_qimage.c iris_vae_qimage.c iris_sample.c iris_image.c jpeg.c iris_safetensors.c iris_qwen3.c iris_qwen3_vision.c iris_qwen3_tokenizer.c terminals.c
 OBJS = $(SRCS:.c=.o)
 CLI_SRCS = iris_cli.c linenoise.c embcache.c
 CLI_OBJS = $(CLI_SRCS:.c=.o)
@@ -22,7 +22,7 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda rocm
+.PHONY: all clean debug lib install info test pngtest tokenizertest ropetest help generic blas mps cuda rocm
 .NOTPARALLEL: mps
 
 # Default: show available targets
@@ -46,6 +46,8 @@ endif
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make test     - Run inference test"
 	@echo "  make pngtest  - Compare PNG load on compressed image"
+	@echo "  make tokenizertest TOKENIZER=<tokenizer.json> - Check prompt truncation"
+	@echo "  make ropetest - Check text encoder positions, no weights needed"
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
@@ -165,7 +167,7 @@ debug: clean $(TARGET)
 # =============================================================================
 # Test and utilities
 # =============================================================================
-test:
+test: ropetest
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
 test-quick:
@@ -178,6 +180,17 @@ pngtest:
 	@/tmp/iris_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/iris_png_compare
 	@echo "PNG TEST PASSED"
+
+tokenizertest:
+	@$(CC) $(CFLAGS_BASE) -I. qwen3_tokenizer_test.c iris_qwen3_tokenizer.c -lm -o iris_tokenizer_test
+	@out=$$(./iris_tokenizer_test $(TOKENIZER) 2>&1); rc=$$?; rm -f iris_tokenizer_test; \
+	 test $$rc = 0 && test "$$(echo "$$out" | grep -c 'prompt truncated from')" = 1
+	@echo "TOKENIZER TEST PASSED"
+
+ropetest:
+	@$(CC) $(CFLAGS_BASE) -I. qwen3_rope_test.c iris_qwen3_tokenizer.c iris_safetensors.c iris_kernels.c -lm -o iris_rope_test
+	@./iris_rope_test; rc=$$?; rm -f iris_rope_test; test $$rc = 0
+	@echo "ROPE TEST PASSED"
 
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin
@@ -212,18 +225,20 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h
+iris.o: iris.c iris.h iris_kernels.h iris_safetensors.h iris_qwen3.h iris_qimage.h
 iris_kernels.o: iris_kernels.c iris_kernels.h
 iris_tokenizer.o: iris_tokenizer.c iris.h
 iris_vae.o: iris_vae.c iris.h iris_kernels.h
 iris_transformer_flux.o: iris_transformer_flux.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
 iris_transformer_zimage.o: iris_transformer_zimage.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
 iris_transformer_flux3.o: iris_transformer_flux3.c iris.h iris_kernels.h iris_safetensors.h iris_dev.h
-iris_sample.o: iris_sample.c iris.h iris_kernels.h
+iris_transformer_qimage.o: iris_transformer_qimage.c iris.h iris_kernels.h iris_safetensors.h iris_qimage.h iris_dev.h
+iris_vae_qimage.o: iris_vae_qimage.c iris.h iris_kernels.h iris_safetensors.h iris_qimage.h iris_dev.h
+iris_sample.o: iris_sample.c iris.h iris_kernels.h iris_qimage.h
 iris_image.o: iris_image.c iris.h
 iris_safetensors.o: iris_safetensors.c iris_safetensors.h
 iris_qwen3.o: iris_qwen3.c iris_qwen3.h iris_safetensors.h
-iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h
+iris_qwen3_tokenizer.o: iris_qwen3_tokenizer.c iris_qwen3.h iris_nfc_table.h
 terminals.o: terminals.c terminals.h iris.h
 iris_cli.o: iris_cli.c iris_cli.h iris.h iris_qwen3.h embcache.h linenoise.h terminals.h
 linenoise.o: linenoise.c linenoise.h

@@ -592,6 +592,13 @@ void iris_silu(float *x, int n) {
     }
 }
 
+void iris_gelu_tanh(float *x, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        float u = x[i];
+        x[i] = 0.5f * u * (1.0f + tanhf(0.7978845608028654f * (u + 0.044715f * u * u * u)));
+    }
+}
+
 /* Fused SiLU(gate) * up in a single pass - avoids double memory traversal */
 void iris_silu_mul(float *gate, const float *up, int n) {
 #ifdef USE_METAL
